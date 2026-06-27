@@ -1,0 +1,30 @@
+# ==========================
+# Everything Converter
+# Python 3.12+
+# install dependencies with: pip install -r requirements.txt
+# ==========================
+
+# GUI
+PySide6>=6.11.1
+
+# Images
+Pillow>=11.3.0
+
+# PDF
+pypdf>=5.0.0
+PyMuPDF>=1.26.0
+
+# Office
+python-docx>=1.2.0
+openpyxl>=3.1.5
+python-pptx>=1.0.2
+
+# Archives
+py7zr>=1.0.0
+rarfile>=4.2
+
+# Data Formats
+PyYAML>=6.0.2
+
+# Optional (future)
+psutil>=7.0.0
