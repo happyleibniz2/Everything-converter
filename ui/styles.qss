@@ -1,0 +1,37 @@
+QMainWindow {
+    background: #f7f8fb;
+}
+
+QListWidget,
+QLineEdit {
+    background: #ffffff;
+    border: 1px solid #d6dbe6;
+    border-radius: 6px;
+    padding: 8px;
+}
+
+QFrame#dropArea {
+    background: #ffffff;
+    border: 2px dashed #9aa7bd;
+    border-radius: 14px;
+    min-height: 320px;
+}
+
+QFrame#dropArea:hover {
+    border-color: #4f7cff;
+    background: #f2f6ff;
+}
+
+QLabel#dropIcon {
+    font-size: 56px;
+}
+
+QLabel#dropTitle {
+    font-size: 24px;
+    font-weight: 700;
+}
+
+QLabel#browseLabel {
+    color: #4f7cff;
+    font-weight: 700;
+}
