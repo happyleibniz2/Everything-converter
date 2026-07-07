@@ -14,6 +14,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QLibraryInfo, Qt
 from PySide6.QtGui import QGuiApplication
+from utils.paths import FFMPEG, OUTPUT, TEMP, LOGS
 
 
 APP_NAME = "Everything Converter"
@@ -34,7 +35,7 @@ def package_version(name: str) -> str:
 
 def ffmpeg_version() -> str:
 
-    ffmpeg = Path("ffmpeg") / "ffmpeg.exe"
+    ffmpeg = FFMPEG
 
     if not ffmpeg.exists():
         return "Not Found"
@@ -145,16 +146,16 @@ def generate_report() -> str:
     lines.append("-" * 60)
 
     lines.append(f"Version           : {ffmpeg_version()}")
-    lines.append(f"Location          : {Path('ffmpeg') / 'ffmpeg.exe'}")
+    lines.append(f"Location          : {FFMPEG}")
 
     lines.append("")
 
     lines.append("DIRECTORIES")
     lines.append("-" * 60)
 
-    lines.append(f"Output            : {Path('output').resolve()}")
-    lines.append(f"Temp              : {Path('temp').resolve()}")
-    lines.append(f"Logs              : {Path('logs').resolve()}")
+    lines.append(f"Output            : {OUTPUT.resolve()}")
+    lines.append(f"Temp              : {TEMP.resolve()}")
+    lines.append(f"Logs              : {LOGS.resolve()}")
 
     lines.append("")
     lines.append("=" * 60)

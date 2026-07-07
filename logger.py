@@ -1,7 +1,7 @@
 import logging
-import os
+from utils.paths import LOGS
 
-os.makedirs("logs", exist_ok=True)
+LOGS.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("EverythingConverter")
 logger.setLevel(logging.INFO)
@@ -12,7 +12,7 @@ formatter = logging.Formatter(
 )
 
 file_handler = logging.FileHandler(
-    "logs/everything_converter.log",
+    LOGS / "everything_converter.log",
     encoding="utf-8"
 )
 file_handler.setFormatter(formatter)
