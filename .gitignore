@@ -182,3 +182,4 @@ cython_debug/
 ffmpeg/ffmpeg.exe
 ffmpeg/ffplay.exe
 ffmpeg/ffprobe.exe
+.vscode/settings.json
