@@ -1,17 +1,16 @@
-# ui/options_dialog.py
 import os
 from pathlib import Path
-from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtWidgets import (
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSpinBox,
     QSlider, QPushButton, QFormLayout, QGroupBox, QCheckBox,
-    QFileDialog, QMessageBox, QTabWidget, QLineEdit, QWidget
+    QFileDialog, QTabWidget, QLineEdit, QWidget, QMessageBox
 )
-from utils.paths import ICONS, RESOURCES
+from utils.paths import ICONS
 from utils.media_info import get_media_info
 
-# Predefined codec mappings (you can expand)
+# Codec mappings
 VIDEO_CODECS = {
     "libx264": "H.264 (x264)",
     "libx265": "H.265 / HEVC",
@@ -29,7 +28,6 @@ AUDIO_CODECS = {
     "libvorbis": "Vorbis",
     "opus": "Opus",
 }
-# Map output extension to recommended codec
 DEFAULT_VIDEO_CODEC = {
     ".mp4": "libx264",
     ".mkv": "libx264",
@@ -49,36 +47,39 @@ DEFAULT_AUDIO_CODEC = {
     ".m4a": "aac",
 }
 
+# Presets (same as main_window)
+PRESETS = {
+    "None": [],
+    "Fast (web friendly)": ["-preset", "veryfast", "-crf", "28"],
+    "High Quality (local)": ["-preset", "slow", "-crf", "18"],
+    "Small Size (mobile)": ["-preset", "veryfast", "-crf", "32", "-vf", "scale=640:-2"],
+    "Lossless (large)": ["-preset", "slow", "-crf", "0"],
+}
+
+
 class ConversionOptionsDialog(QDialog):
     def __init__(self, input_files, converter, parent=None):
         super().__init__(parent)
-        self.input_files = input_files  # list of file paths
-        self.converter = converter      # the selected converter instance
-        self.options = {}               # will hold user selections
-
-        # Get info for first file (we assume all have similar properties)
+        self.input_files = input_files
+        self.converter = converter
         self.media_info = get_media_info(input_files[0]) if input_files else {}
-
         self.setWindowTitle("Conversion Options")
-        self.resize(700, 550)
+        self.resize(720, 600)
         self.setModal(True)
-
         self._build_ui()
         self._populate_defaults()
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
 
-        # --- File info area ---
+        # --- File info ---
         info_widget = QWidget()
         info_layout = QHBoxLayout(info_widget)
-        # Icon
         self.icon_label = QLabel()
         self.icon_label.setFixedSize(64, 64)
         self._set_file_icon()
         info_layout.addWidget(self.icon_label)
 
-        # Details
         details_layout = QVBoxLayout()
         self.file_name_label = QLabel(Path(self.input_files[0]).name)
         self.file_name_label.setStyleSheet("font-weight: bold;")
@@ -88,7 +89,6 @@ class ConversionOptionsDialog(QDialog):
         self.size_label = QLabel(f"Size: {self._format_size(size)}")
         details_layout.addWidget(self.size_label)
 
-        # Duration / resolution if video
         if self.media_info:
             dur = self.media_info.get("duration", 0)
             if dur:
@@ -97,22 +97,52 @@ class ConversionOptionsDialog(QDialog):
             if "width" in self.media_info and "height" in self.media_info:
                 self.res_label = QLabel(f"Resolution: {self.media_info['width']}x{self.media_info['height']}")
                 details_layout.addWidget(self.res_label)
-
         info_layout.addLayout(details_layout)
         info_layout.addStretch()
         main_layout.addWidget(info_widget)
 
-        # --- Tabs for options ---
+        # --- Tabs ---
         self.tabs = QTabWidget()
 
-        # General tab (format info)
+        # General tab (preset, copy, trim, threads, delete source, shutdown)
         general_tab = QWidget()
         general_layout = QFormLayout(general_tab)
-        general_layout.addRow("Input format:", QLabel(", ".join(self.converter.input_extensions)))
-        general_layout.addRow("Output format:", QLabel(self.converter.output_extension))
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(list(PRESETS.keys()))
+        general_layout.addRow("Preset", self.preset_combo)
+
+        self.copy_mode_check = QCheckBox("Copy streams (no re-encode, remux only)")
+        general_layout.addRow(self.copy_mode_check)
+
+        self.copy_audio_check = QCheckBox("Copy audio (no re-encode)")
+        general_layout.addRow(self.copy_audio_check)
+
+        trim_layout = QHBoxLayout()
+        self.start_time_edit = QLineEdit()
+        self.start_time_edit.setPlaceholderText("Start (HH:MM:SS)")
+        self.end_time_edit = QLineEdit()
+        self.end_time_edit.setPlaceholderText("End (HH:MM:SS)")
+        trim_layout.addWidget(QLabel("From:"))
+        trim_layout.addWidget(self.start_time_edit)
+        trim_layout.addWidget(QLabel("To:"))
+        trim_layout.addWidget(self.end_time_edit)
+        general_layout.addRow("Trim", trim_layout)
+
+        self.thread_spin = QSpinBox()
+        self.thread_spin.setRange(0, 64)
+        self.thread_spin.setSpecialValueText("Auto")
+        general_layout.addRow("Threads", self.thread_spin)
+
+        self.delete_source_check = QCheckBox("Delete source after conversion")
+        general_layout.addRow(self.delete_source_check)
+
+        self.shutdown_check = QCheckBox("Shutdown computer after conversion")
+        general_layout.addRow(self.shutdown_check)
+
         self.tabs.addTab(general_tab, "General")
 
-        # Video tab (if category is Video)
+        # Video tab
         if self.converter.category == "Video":
             video_tab = QWidget()
             video_layout = QVBoxLayout(video_tab)
@@ -121,15 +151,13 @@ class ConversionOptionsDialog(QDialog):
             codec_layout = QHBoxLayout()
             codec_layout.addWidget(QLabel("Video Codec:"))
             self.video_codec_combo = QComboBox()
-            # Populate with relevant codecs
             self._populate_codec_combo(self.video_codec_combo, VIDEO_CODECS, self.converter.output_extension)
             codec_layout.addWidget(self.video_codec_combo)
             video_layout.addLayout(codec_layout)
 
-            # Quality (CRF or bitrate)
+            # Quality (CRF / Bitrate)
             quality_group = QGroupBox("Quality")
             quality_layout = QFormLayout(quality_group)
-
             self.quality_mode_combo = QComboBox()
             self.quality_mode_combo.addItems(["CRF (Constant Rate Factor)", "Bitrate (kbps)"])
             self.quality_mode_combo.currentIndexChanged.connect(self._on_quality_mode_changed)
@@ -142,10 +170,10 @@ class ConversionOptionsDialog(QDialog):
             self.crf_slider.setTickPosition(QSlider.TicksBelow)
             self.crf_label = QLabel("23")
             self.crf_slider.valueChanged.connect(lambda v: self.crf_label.setText(str(v)))
-            crf_layout = QHBoxLayout()
-            crf_layout.addWidget(self.crf_slider)
-            crf_layout.addWidget(self.crf_label)
-            quality_layout.addRow("CRF value:", crf_layout)
+            crf_row = QHBoxLayout()
+            crf_row.addWidget(self.crf_slider)
+            crf_row.addWidget(self.crf_label)
+            quality_layout.addRow("CRF value:", crf_row)
 
             self.bitrate_spin = QSpinBox()
             self.bitrate_spin.setRange(100, 50000)
@@ -153,10 +181,9 @@ class ConversionOptionsDialog(QDialog):
             self.bitrate_spin.setSuffix(" kbps")
             self.bitrate_spin.setEnabled(False)
             quality_layout.addRow("Bitrate:", self.bitrate_spin)
-
             video_layout.addWidget(quality_group)
 
-            # Resolution scaling
+            # Scaling
             scale_group = QGroupBox("Resolution")
             scale_layout = QFormLayout(scale_group)
             self.scale_preset_combo = QComboBox()
@@ -182,12 +209,11 @@ class ConversionOptionsDialog(QDialog):
 
             self.tabs.addTab(video_tab, "Video")
 
-        # Audio tab (if category is Video or Audio)
+        # Audio tab (if Video or Audio)
         if self.converter.category in ("Video", "Audio"):
             audio_tab = QWidget()
             audio_layout = QVBoxLayout(audio_tab)
 
-            # Audio codec
             codec_layout = QHBoxLayout()
             codec_layout.addWidget(QLabel("Audio Codec:"))
             self.audio_codec_combo = QComboBox()
@@ -195,7 +221,6 @@ class ConversionOptionsDialog(QDialog):
             codec_layout.addWidget(self.audio_codec_combo)
             audio_layout.addLayout(codec_layout)
 
-            # Audio bitrate
             bitrate_layout = QHBoxLayout()
             bitrate_layout.addWidget(QLabel("Bitrate (kbps):"))
             self.audio_bitrate_spin = QSpinBox()
@@ -205,7 +230,6 @@ class ConversionOptionsDialog(QDialog):
             bitrate_layout.addWidget(self.audio_bitrate_spin)
             audio_layout.addLayout(bitrate_layout)
 
-            # Sample rate
             sr_layout = QHBoxLayout()
             sr_layout.addWidget(QLabel("Sample Rate (Hz):"))
             self.sample_rate_combo = QComboBox()
@@ -215,7 +239,7 @@ class ConversionOptionsDialog(QDialog):
 
             self.tabs.addTab(audio_tab, "Audio")
 
-        # Extra arguments tab
+        # Advanced (extra args)
         extra_tab = QWidget()
         extra_layout = QVBoxLayout(extra_tab)
         self.extra_args_edit = QLineEdit()
@@ -226,7 +250,7 @@ class ConversionOptionsDialog(QDialog):
 
         main_layout.addWidget(self.tabs)
 
-        # --- Buttons ---
+        # Buttons
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         self.convert_btn = QPushButton("Convert")
@@ -238,22 +262,12 @@ class ConversionOptionsDialog(QDialog):
         main_layout.addLayout(btn_layout)
 
     def _set_file_icon(self):
-        # Use a generic icon based on extension
         ext = Path(self.input_files[0]).suffix.lower()
         icon_map = {
-            ".mp4": "video.svg",
-            ".mkv": "video.svg",
-            ".mov": "video.svg",
-            ".avi": "video.svg",
-            ".mp3": "audio.svg",
-            ".wav": "audio.svg",
-            ".flac": "audio.svg",
-            ".aac": "audio.svg",
-            ".ogg": "audio.svg",
-            ".m4a": "audio.svg",
-            ".jpg": "image.svg",
-            ".jpeg": "image.svg",
-            ".png": "image.svg",
+            ".mp4": "video.svg", ".mkv": "video.svg", ".mov": "video.svg", ".avi": "video.svg",
+            ".mp3": "audio.svg", ".wav": "audio.svg", ".flac": "audio.svg", ".aac": "audio.svg",
+            ".ogg": "audio.svg", ".m4a": "audio.svg",
+            ".jpg": "image.svg", ".jpeg": "image.svg", ".png": "image.svg",
         }
         icon_name = icon_map.get(ext, "file.svg")
         icon_path = ICONS / icon_name
@@ -282,11 +296,8 @@ class ConversionOptionsDialog(QDialog):
         return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
 
     def _populate_codec_combo(self, combo, codec_dict, output_ext):
-        # Filter codecs that are appropriate for output extension (optional)
         for key, display in codec_dict.items():
             combo.addItem(display, key)
-
-        # Set default
         default_codec = None
         if self.converter.category == "Video":
             default_codec = DEFAULT_VIDEO_CODEC.get(output_ext)
@@ -298,17 +309,13 @@ class ConversionOptionsDialog(QDialog):
                 combo.setCurrentIndex(idx)
 
     def _populate_defaults(self):
-        # Pre-fill from media info if available
+        # Load from media info if available
         if self.media_info:
-            if "video_codec" in self.media_info:
-                # Try to set codec based on source? Not necessary.
-                pass
             if "width" in self.media_info:
                 self.scale_width.setValue(self.media_info["width"])
                 self.scale_height.setValue(self.media_info["height"])
 
     def _on_quality_mode_changed(self, index):
-        # Enable/disable appropriate controls
         is_crf = (index == 0)
         self.crf_slider.setEnabled(is_crf)
         self.crf_label.setEnabled(is_crf)
@@ -329,44 +336,44 @@ class ConversionOptionsDialog(QDialog):
         elif index == 4:
             self.scale_width.setEnabled(True)
             self.scale_height.setEnabled(True)
-        else:  # Original
-            # Disable custom, set to 0 (meaning original)
+        else:
             self.scale_width.setValue(0)
             self.scale_height.setValue(0)
             self.scale_width.setEnabled(False)
             self.scale_height.setEnabled(False)
 
     def get_options(self):
-        """Return a dict of user selections for conversion."""
+        """Return a dict of all user choices."""
         opts = {}
 
-        # Video options
-        if self.converter.category == "Video":
-            video_codec = self.video_codec_combo.currentData()
-            if video_codec:
-                opts["video_codec"] = video_codec
+        # General
+        opts["preset"] = self.preset_combo.currentText()
+        opts["copy_mode"] = self.copy_mode_check.isChecked()
+        opts["copy_audio"] = self.copy_audio_check.isChecked()
+        opts["start_time"] = self.start_time_edit.text().strip() or None
+        opts["end_time"] = self.end_time_edit.text().strip() or None
+        opts["threads"] = self.thread_spin.value()
+        opts["delete_source"] = self.delete_source_check.isChecked()
+        opts["shutdown"] = self.shutdown_check.isChecked()
 
-            # Quality
+        # Video
+        if self.converter.category == "Video":
+            opts["video_codec"] = self.video_codec_combo.currentData()
             mode = self.quality_mode_combo.currentIndex()
-            if mode == 0:  # CRF
+            if mode == 0:
                 opts["crf"] = self.crf_slider.value()
             else:
                 opts["video_bitrate"] = self.bitrate_spin.value()
-
-            # Scale
             if self.scale_preset_combo.currentIndex() == 0:
-                opts["scale"] = None  # original
+                opts["scale"] = None
             else:
                 w = self.scale_width.value()
                 h = self.scale_height.value()
-                if w > 0 and h > 0:
-                    opts["scale"] = f"{w}:{h}"
+                opts["scale"] = f"{w}:{h}" if w > 0 and h > 0 else None
 
-        # Audio options
+        # Audio
         if self.converter.category in ("Video", "Audio"):
-            audio_codec = self.audio_codec_combo.currentData()
-            if audio_codec:
-                opts["audio_codec"] = audio_codec
+            opts["audio_codec"] = self.audio_codec_combo.currentData()
             opts["audio_bitrate"] = self.audio_bitrate_spin.value()
             opts["sample_rate"] = int(self.sample_rate_combo.currentText())
 
@@ -374,5 +381,7 @@ class ConversionOptionsDialog(QDialog):
         extra = self.extra_args_edit.text().strip()
         if extra:
             opts["extra_args"] = extra.split()
+        else:
+            opts["extra_args"] = []
 
         return opts
