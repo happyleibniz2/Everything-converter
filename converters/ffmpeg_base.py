@@ -1,6 +1,6 @@
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple
 
 from converters.base import Converter
 from utils.paths import FFMPEG
@@ -9,7 +9,7 @@ from utils.paths import FFMPEG
 class FFmpegConverter(Converter):
     """
     Generic converter that uses a bundled FFmpeg executable.
-    Supports both simple conversion and progress reporting.
+    Supports both simple conversion and progress reporting with overrides.
     """
 
     category = "Video"  # can be overridden for audio etc.
@@ -30,14 +30,31 @@ class FFmpegConverter(Converter):
         self.audio_codec = audio_codec
         self.extra_args = extra_args or []
 
+        # Override storage (initially None)
+        self._video_codec_override = None
+        self._audio_codec_override = None
+        self._extra_args_override = None
+
+    def set_override(self, video_codec=None, audio_codec=None, extra_args=None):
+        """Set temporary overrides for codecs and extra arguments."""
+        self._video_codec_override = video_codec
+        self._audio_codec_override = audio_codec
+        self._extra_args_override = extra_args
+
     def _build_command(self, input_file: str, output_file: str) -> List[str]:
-        """Build the ffmpeg command line."""
+        """Build the ffmpeg command using overrides if present."""
         cmd = [str(FFMPEG), "-hide_banner", "-y", "-i", input_file]
-        if self.video_codec:
-            cmd.extend(["-c:v", self.video_codec])
-        if self.audio_codec:
-            cmd.extend(["-c:a", self.audio_codec])
-        cmd.extend(self.extra_args)
+
+        vcodec = self._video_codec_override if self._video_codec_override is not None else self.video_codec
+        acodec = self._audio_codec_override if self._audio_codec_override is not None else self.audio_codec
+        extra = self._extra_args_override if self._extra_args_override is not None else self.extra_args
+
+        if vcodec:
+            cmd.extend(["-c:v", vcodec])
+        if acodec:
+            cmd.extend(["-c:a", acodec])
+        if extra:
+            cmd.extend(extra)
         cmd.append(output_file)
         return cmd
 
@@ -59,14 +76,9 @@ class FFmpegConverter(Converter):
         progress_callback: Optional[Callable[[int, float, float], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """
-        Run ffmpeg and report progress.
-        Progress callback receives (percent, elapsed_seconds, remaining_seconds).
-        """
         if not FFMPEG.exists():
             raise FileNotFoundError("Bundled FFmpeg executable not found.")
 
-        # Try to get total duration via ffprobe (if available)
         ffprobe = FFMPEG.parent / "ffprobe.exe"
         duration = None
         if ffprobe.exists():
@@ -74,12 +86,9 @@ class FFmpegConverter(Converter):
                 probe = subprocess.run(
                     [
                         str(ffprobe),
-                        "-v",
-                        "error",
-                        "-show_entries",
-                        "format=duration",
-                        "-of",
-                        "default=noprint_wrappers=1:nokey=1",
+                        "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
                         input_file,
                     ],
                     capture_output=True,
@@ -88,29 +97,26 @@ class FFmpegConverter(Converter):
                 if probe.returncode == 0:
                     duration = float(probe.stdout.strip())
             except Exception:
-                duration = None
+                pass
 
-        # Build command with progress output
-        command = self._build_command(input_file, output_file)
-        # Insert -progress pipe:1 and -nostats after the input
-        # We'll insert right after the input
-        # Find the index of -i and the input file, then insert after that
-        # Simpler: reconstruct with -progress
         base_cmd = [
             str(FFMPEG),
             "-hide_banner",
             "-y",
-            "-i",
-            input_file,
-            "-progress",
-            "pipe:1",
+            "-i", input_file,
+            "-progress", "pipe:1",
             "-nostats",
         ]
-        if self.video_codec:
-            base_cmd.extend(["-c:v", self.video_codec])
-        if self.audio_codec:
-            base_cmd.extend(["-c:a", self.audio_codec])
-        base_cmd.extend(self.extra_args)
+        vcodec = self._video_codec_override if self._video_codec_override is not None else self.video_codec
+        acodec = self._audio_codec_override if self._audio_codec_override is not None else self.audio_codec
+        extra = self._extra_args_override if self._extra_args_override is not None else self.extra_args
+
+        if vcodec:
+            base_cmd.extend(["-c:v", vcodec])
+        if acodec:
+            base_cmd.extend(["-c:a", acodec])
+        if extra:
+            base_cmd.extend(extra)
         base_cmd.append(output_file)
 
         proc = subprocess.Popen(
@@ -122,6 +128,7 @@ class FFmpegConverter(Converter):
         )
 
         out_time = 0.0
+        done = False
         try:
             if proc.stdout is None:
                 proc.wait()
@@ -131,7 +138,6 @@ class FFmpegConverter(Converter):
                     if not line:
                         continue
 
-                    # Check cancellation
                     if should_cancel and should_cancel():
                         try:
                             proc.terminate()
@@ -145,9 +151,8 @@ class FFmpegConverter(Converter):
                             try:
                                 out_time = int(val) / 1000.0
                             except Exception:
-                                out_time = 0.0
+                                pass
                         elif key == "out_time":
-                            # fallback if out_time_ms not present
                             try:
                                 parts = val.split(":")
                                 h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
@@ -155,15 +160,11 @@ class FFmpegConverter(Converter):
                             except Exception:
                                 pass
                         elif key == "progress" and val == "end":
-                            # finished
+                            done = True
                             if progress_callback:
-                                if duration:
-                                    progress_callback(100, duration, 0.0)
-                                else:
-                                    progress_callback(100, out_time, 0.0)
+                                progress_callback(100, duration or out_time, 0.0)
 
-                    # Emit periodic progress
-                    if progress_callback and out_time is not None:
+                    if progress_callback and out_time is not None and not done:
                         if duration:
                             percent = int(min(100, (out_time / duration) * 100))
                             remaining = max(0.0, duration - out_time)
@@ -176,9 +177,14 @@ class FFmpegConverter(Converter):
             if rc != 0:
                 stderr = proc.stderr.read() if proc.stderr is not None else ""
                 raise RuntimeError(stderr.strip() or "FFmpeg conversion failed")
+
         finally:
             try:
                 if proc.stdout:
                     proc.stdout.close()
             except Exception:
                 pass
+
+        # If we never got a progress=end, force 100% now
+        if not done and progress_callback:
+            progress_callback(100, duration or out_time, 0.0)

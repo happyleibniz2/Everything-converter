@@ -1,10 +1,8 @@
 from pathlib import Path
 
 from converters.image_converter import PNGtoJPG
-# Import all FFmpeg-based converters (video + audio)
 from converters.video_converter import ALL_FFMPEG_CONVERTERS
 
-# Combine all available converters
 CONVERTERS = [PNGtoJPG()] + ALL_FFMPEG_CONVERTERS
 
 

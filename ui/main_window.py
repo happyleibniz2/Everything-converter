@@ -842,22 +842,54 @@ class MainWindow(QMainWindow):
             self.destination_label.setText("Destination example: Select files to show the output path")
 
     def convert_selected_files(self):
+        """Start the conversion process with user-specified options."""
+        # 1. Check if a conversion is already running
         if self.converter_thread and self.converter_thread.isRunning():
-            QMessageBox.information(self, "Conversion in progress", "Please wait until the current conversion finishes.")
+            QMessageBox.information(
+                self,
+                "Conversion in progress",
+                "Please wait until the current conversion finishes."
+            )
             return
 
+        # 2. Ensure files are selected
         if not self.selected_files:
             self.statusBar().showMessage("Ready")
-            QMessageBox.information(self, "No files selected", "Drop files or click Open before converting.")
+            QMessageBox.information(
+                self,
+                "No files selected",
+                "Drop files or click Open before converting."
+            )
             return
 
+        # 3. Ensure a converter is selected
         converter = self.selected_converter()
         if converter is None:
             self.statusBar().showMessage("No converter selected")
-            QMessageBox.warning(self, "No converter selected", "Select a conversion from the list first.")
+            QMessageBox.warning(
+                self,
+                "No converter selected",
+                "Select a conversion from the list first."
+            )
             return
 
-        total_files = len(self.selected_files)
+        # 4. Show the options dialog and get user settings
+        from ui.options_dialog import ConversionOptionsDialog
+        options_dialog = ConversionOptionsDialog(self.selected_files, converter, self)
+        if options_dialog.exec() != QDialog.Accepted:
+            # User cancelled the options dialog
+            return
+
+        user_options = options_dialog.get_options()
+
+        # 5. Resolve output file paths (handle conflicts)
+        output_pairs = self.resolve_output_paths(converter)
+        if not output_pairs:
+            self.statusBar().showMessage("Conversion canceled")
+            return
+
+        # 6. Prepare UI for conversion
+        total_files = len(output_pairs)
         self.progress_bar.setMinimum(0)
         self.progress_bar.setMaximum(total_files)
         self.progress_bar.setValue(0)
@@ -875,17 +907,29 @@ class MainWindow(QMainWindow):
 
         self.current_converter_label.setText(f"Current Converter: {converter.name}")
 
-        output_pairs = self.resolve_output_paths(converter)
-        if not output_pairs:
-            self.statusBar().showMessage("Conversion canceled")
-            self._update_conversion_controls(True)
-            self.content_stack.setCurrentIndex(0)
-            return
+        # 7. Build extra ffmpeg arguments from user options
+        extra_args = []
+        if "crf" in user_options:
+            extra_args.extend(["-crf", str(user_options["crf"])])
+        if "video_bitrate" in user_options:
+            extra_args.extend(["-b:v", f"{user_options['video_bitrate']}k"])
+        if "scale" in user_options and user_options["scale"]:
+            extra_args.extend(["-vf", f"scale={user_options['scale']}"])
+        if "audio_bitrate" in user_options:
+            extra_args.extend(["-b:a", f"{user_options['audio_bitrate']}k"])
+        if "sample_rate" in user_options:
+            extra_args.extend(["-ar", str(user_options["sample_rate"])])
+        if "extra_args" in user_options:
+            extra_args.extend(user_options["extra_args"])
 
-        total_files = len(output_pairs)
-        self.progress_bar.setMaximum(total_files)
-        self.conversion_info_label.setText(f"0 / {total_files} files | {self.current_speed}")
+        # 8. Apply overrides to the converter instance
+        converter.set_override(
+            video_codec=user_options.get("video_codec"),
+            audio_codec=user_options.get("audio_codec"),
+            extra_args=extra_args
+        )
 
+        # 9. Create and start the worker thread
         self.converter_thread = ConversionWorker(converter, output_pairs)
         self.converter_thread.progress_updated.connect(self._on_conversion_progress)
         self.converter_thread.status_message.connect(self._on_conversion_status)
