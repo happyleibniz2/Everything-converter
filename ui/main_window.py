@@ -45,6 +45,7 @@ class ConversionWorker(QThread):
         self.start_time = None
         self.bytes_processed = 0
         self.delete_source = delete_source
+        self.current_process = None
 
     def pause(self):
         self.is_paused = True
@@ -54,8 +55,14 @@ class ConversionWorker(QThread):
 
     def cancel(self):
         self.is_cancelled = True
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                self.current_process.terminate()
+            except Exception:
+                pass
 
     def run(self):
+        
         total_files = len(self.file_pairs)
         self.start_time = time.time()
 
@@ -103,9 +110,13 @@ class ConversionWorker(QThread):
                         self.time_updated.emit(elapsed_text, remaining_text)
                         self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
 
-                    self.converter.convert_with_progress(input_file, temp_output,
-                                                         progress_callback=_progress_cb,
-                                                         should_cancel=lambda: self.is_cancelled)
+                    self.converter.convert_with_progress(
+                        input_file,
+                        temp_output,
+                        progress_callback=_progress_cb,
+                        should_cancel=lambda: self.is_cancelled,
+                        process_callback=lambda proc: setattr(self, 'current_process', proc)
+                    )
                 else:
                     self.converter.convert(input_file, temp_output)
 
@@ -132,6 +143,8 @@ class ConversionWorker(QThread):
                 if self.is_cancelled:
                     self.status_message.emit("Conversion canceled")
                     break
+            finally:
+                self.current_process = None
 
             elapsed = time.time() - self.start_time
             remaining = 0.0
@@ -1110,8 +1123,10 @@ class MainWindow(QMainWindow):
 
     def cancel_conversion(self):
         if self.converter_thread:
+            self.statusBar().showMessage("Canceling conversion...")
+            self.cancel_button.setEnabled(False)
+            self.pause_button.setEnabled(False)
             self.converter_thread.cancel()
-            self.converter_thread.wait()
 
     def finish_conversion(self):
         converted = self.converter_thread.converted if self.converter_thread else 0

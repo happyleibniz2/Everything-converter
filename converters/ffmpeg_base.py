@@ -59,12 +59,14 @@ class FFmpegConverter(Converter):
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             error_msg = result.stderr.strip() or "FFmpeg conversion failed"
-            logger.error("FFmpeg stderr: %s", error_msg)
+            logger.critical("FFmpeg stderr: %s", error_msg)
             raise RuntimeError(error_msg)
 
     def convert_with_progress(self, input_file, output_file,
-                              progress_callback=None, should_cancel=None):
+                              progress_callback=None, should_cancel=None,
+                              process_callback=None):
         if not FFMPEG.exists():
+            logger.critical("Bundled FFmpeg executable not found at %s", FFMPEG)
             raise FileNotFoundError(f"Bundled FFmpeg executable not found at {FFMPEG}")
 
         # Get duration
@@ -110,31 +112,37 @@ class FFmpegConverter(Converter):
 
         logger.debug("FFmpeg command: %s", " ".join(base_cmd))
 
-        # ========== FIX ==========
-        # Explicitly use UTF‑8 and replace undecodable bytes with '�'
         proc = subprocess.Popen(
             base_cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            encoding='utf-8',       # <-- ADD THIS
-            errors='replace'        # <-- ADD THIS
+            encoding='utf-8',
+            errors='replace'
         )
-        # =========================
+        if process_callback:
+            process_callback(proc)
 
+        output_lines = []
         out_time = 0.0
         done = False
         try:
             if proc.stdout is None:
-                proc.wait()
+                rc = proc.wait()
             else:
                 for line in proc.stdout:
                     line = line.strip()
                     if not line:
                         continue
+                    output_lines.append(line)
                     if should_cancel and should_cancel():
                         proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
                         raise RuntimeError("Cancelled")
                     if "=" in line:
                         key, val = line.split("=", 1)
@@ -164,16 +172,21 @@ class FFmpegConverter(Converter):
                             remaining = 0.0
                         progress_callback(percent, out_time, remaining)
 
-            rc = proc.wait()
+                rc = proc.wait()
+
             if rc != 0:
-                stderr = proc.stderr.read() if proc.stderr is not None else ""
-                logger.error("FFmpeg stderr: %s", stderr)
-                raise RuntimeError(stderr.strip() or "FFmpeg conversion failed")
+                error_text = "\n".join(output_lines[-50:])
+                logger.error("FFmpeg exited with code %s", rc)
+                raise RuntimeError(error_text.strip() or "FFmpeg conversion failed")
         finally:
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
             if proc.stdout:
                 proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
 
         if not done and progress_callback:
             progress_callback(100, duration or out_time, 0.0)

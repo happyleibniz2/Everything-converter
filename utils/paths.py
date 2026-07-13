@@ -1,7 +1,6 @@
 from pathlib import Path
-
+from venv import logger
 ROOT = Path(__file__).resolve().parent.parent
-
 FFMPEG = ROOT / "ffmpeg" / "ffmpeg.exe"
 FFPROBE = ROOT / "ffmpeg" / "ffprobe.exe"
 OUTPUT = ROOT / "output"
