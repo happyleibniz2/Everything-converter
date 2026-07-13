@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QTimeEdit, QButtonGroup, QRadioButton, QListWidgetItem,
     QMenu, QSystemTrayIcon, QSplitter
 )
+import psutil  # <-- NEW import for process control
 from logger import logger
 from registry import CONVERTERS, find_converters, search_converters
 from converters.extensions import EXTENSION_DESCRIPTIONS
@@ -49,17 +50,48 @@ class ConversionWorker(QThread):
 
     def pause(self):
         self.is_paused = True
+        # Actually SUSPEND the running ffmpeg process at the OS level
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                psutil.Process(self.current_process.pid).suspend()
+                logger.info(f"Suspended FFmpeg PID {self.current_process.pid}")
+            except Exception as e:
+                logger.error(f"Failed to suspend: {e}")
 
     def resume(self):
         self.is_paused = False
+        # Actually RESUME the running ffmpeg process
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                psutil.Process(self.current_process.pid).resume()
+                logger.info(f"Resumed FFmpeg PID {self.current_process.pid}")
+            except Exception as e:
+                logger.error(f"Failed to resume: {e}")
 
     def cancel(self):
         self.is_cancelled = True
         if self.current_process and self.current_process.poll() is None:
             try:
-                self.current_process.terminate()
-            except Exception:
-                pass
+                proc = psutil.Process(self.current_process.pid)
+                # Kill all child processes first (ffmpeg sometimes spawns them)
+                children = proc.children(recursive=True)
+                for child in children:
+                    child.kill()
+                # Kill the main ffmpeg process (SIGKILL on Linux, TerminateProcess on Windows)
+                proc.kill()
+                # Wait a moment to prevent zombie processes
+                proc.wait(timeout=2)
+                logger.info(f"Force-killed FFmpeg PID {self.current_process.pid}")
+            except psutil.NoSuchProcess:
+                pass  # Already dead
+            except Exception as e:
+                logger.warning(f"Psutil kill failed, falling back to subprocess: {e}")
+                # Fallback to your original method just in case
+                try:
+                    self.current_process.kill()
+                    self.current_process.wait(timeout=2)
+                except Exception:
+                    pass
 
     def run(self):
         
@@ -1132,7 +1164,13 @@ class MainWindow(QMainWindow):
         converted = self.converter_thread.converted if self.converter_thread else 0
         errors = self.converter_thread.errors if self.converter_thread else []
         if errors:
-            QMessageBox.warning(self, "Conversion finished with errors", "\n".join(errors))
+            # Use a QMessageBox with detailed text (selectable & copyable)
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Conversion finished with errors")
+            msg.setText(f"{len(errors)} file(s) failed to convert.\nClick 'Show Details' to see the list.")
+            msg.setDetailedText("\n".join(errors))
+            msg.exec()
         elif converted:
             QMessageBox.information(self, "Conversion complete", f"Converted {converted} file(s).")
         self.content_stack.setCurrentIndex(0)
