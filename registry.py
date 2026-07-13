@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from converters.image_converter import PNGtoJPG
+from converters.image_converter import ALL_IMAGE_CONVERTERS
 from converters.video_converter import ALL_FFMPEG_CONVERTERS
 
-CONVERTERS = [PNGtoJPG()] + ALL_FFMPEG_CONVERTERS
+CONVERTERS = ALL_IMAGE_CONVERTERS + ALL_FFMPEG_CONVERTERS
 
 
 def normalize_extension(extension):

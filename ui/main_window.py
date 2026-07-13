@@ -4,8 +4,8 @@ import time
 import shutil
 import platform
 from pathlib import Path
-from PyQt5.QtCore import pyqtSignal, Qt, QThread, QSize, QSettings
-from PyQt5.QtGui import QIcon, QPixmap, QPainter, QBrush
+from PyQt5.QtCore import pyqtSignal, Qt, QThread, QSize, QSettings, QUrl
+from PyQt5.QtGui import QIcon, QPixmap, QPainter, QBrush, QDesktopServices
 from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QTimeEdit, QButtonGroup, QRadioButton, QListWidgetItem,
     QMenu, QSystemTrayIcon, QSplitter
 )
-import psutil  # <-- NEW import for process control
+import psutil
 from logger import logger
 from registry import CONVERTERS, find_converters, search_converters
 from converters.extensions import EXTENSION_DESCRIPTIONS
@@ -24,6 +24,7 @@ from system_info import APP_VERSION, BUILD_TYPE, ffmpeg_version
 from utils.paths import ICONS, RESOURCES, TEMP
 from converters.ffmpeg_base import FFmpegConverter
 from ui.options_dialog import ConversionOptionsDialog, PRESETS
+
 
 # ---------- Worker Thread ----------
 class ConversionWorker(QThread):
@@ -50,7 +51,6 @@ class ConversionWorker(QThread):
 
     def pause(self):
         self.is_paused = True
-        # Actually SUSPEND the running ffmpeg process at the OS level
         if self.current_process and self.current_process.poll() is None:
             try:
                 psutil.Process(self.current_process.pid).suspend()
@@ -60,7 +60,6 @@ class ConversionWorker(QThread):
 
     def resume(self):
         self.is_paused = False
-        # Actually RESUME the running ffmpeg process
         if self.current_process and self.current_process.poll() is None:
             try:
                 psutil.Process(self.current_process.pid).resume()
@@ -73,20 +72,16 @@ class ConversionWorker(QThread):
         if self.current_process and self.current_process.poll() is None:
             try:
                 proc = psutil.Process(self.current_process.pid)
-                # Kill all child processes first (ffmpeg sometimes spawns them)
                 children = proc.children(recursive=True)
                 for child in children:
                     child.kill()
-                # Kill the main ffmpeg process (SIGKILL on Linux, TerminateProcess on Windows)
                 proc.kill()
-                # Wait a moment to prevent zombie processes
                 proc.wait(timeout=2)
                 logger.info(f"Force-killed FFmpeg PID {self.current_process.pid}")
             except psutil.NoSuchProcess:
-                pass  # Already dead
+                pass
             except Exception as e:
                 logger.warning(f"Psutil kill failed, falling back to subprocess: {e}")
-                # Fallback to your original method just in case
                 try:
                     self.current_process.kill()
                     self.current_process.wait(timeout=2)
@@ -94,7 +89,6 @@ class ConversionWorker(QThread):
                     pass
 
     def run(self):
-        
         total_files = len(self.file_pairs)
         self.start_time = time.time()
 
@@ -108,6 +102,10 @@ class ConversionWorker(QThread):
             self.current_file_updated.emit(Path(input_file).name)
             self.status_message.emit(f"Converting {index}/{total_files}...")
 
+            temp_output = str(TEMP / f"temp_{Path(output_file).name}")
+            os.makedirs(os.path.dirname(temp_output), exist_ok=True)
+            moved = False
+
             try:
                 file_size = Path(input_file).stat().st_size
                 logger.info("================================================")
@@ -116,10 +114,6 @@ class ConversionWorker(QThread):
                 logger.info("Output: %s", output_file)
                 logger.info("Converter: %s", self.converter.name)
                 start_file = time.time()
-
-                # Use temporary file if output is in final location
-                temp_output = str(TEMP / f"temp_{Path(output_file).name}")
-                os.makedirs(os.path.dirname(temp_output), exist_ok=True)
 
                 if hasattr(self.converter, "convert_with_progress"):
                     def _progress_cb(percent, elapsed_sec, remaining_sec):
@@ -152,9 +146,9 @@ class ConversionWorker(QThread):
                 else:
                     self.converter.convert(input_file, temp_output)
 
-                # Move temp to final output
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
                 shutil.move(temp_output, output_file)
+                moved = True
 
                 duration = time.time() - start_file
                 self.bytes_processed += file_size
@@ -176,6 +170,12 @@ class ConversionWorker(QThread):
                     self.status_message.emit("Conversion canceled")
                     break
             finally:
+                if not moved and os.path.exists(temp_output):
+                    try:
+                        os.remove(temp_output)
+                        logger.info("Removed temporary file: %s", temp_output)
+                    except Exception as e:
+                        logger.warning("Failed to remove temporary file: %s", e)
                 self.current_process = None
 
             elapsed = time.time() - self.start_time
@@ -326,7 +326,7 @@ class SettingsDialog(QDialog):
         general_layout.addRow("Language", self.language_combo)
 
         self.overwrite_combo = QComboBox()
-        self.overwrite_combo.addItems(["Rename", "Overwrite", "Skip"])
+        self.overwrite_combo.addItems(["Rename", "Overwrite", "Skip", "Ask for name"])
         general_layout.addRow("Overwrite behavior", self.overwrite_combo)
 
         self.logging_combo = QComboBox()
@@ -635,6 +635,7 @@ class MainWindow(QMainWindow):
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(content)
 
+        # --- Conversion view with progress and completion ---
         conversion_view = QWidget()
         conversion_layout = QVBoxLayout(conversion_view)
         conversion_layout.setAlignment(Qt.AlignCenter)
@@ -661,7 +662,9 @@ class MainWindow(QMainWindow):
         self.conversion_info_label.setObjectName("conversionInfoLabel")
         self.conversion_info_label.setAlignment(Qt.AlignCenter)
 
-        timing_layout = QHBoxLayout()
+        # Timing container
+        self.timing_container = QWidget()
+        timing_layout = QHBoxLayout(self.timing_container)
         timing_layout.addWidget(QLabel("Elapsed:"))
         self.elapsed_label = QLabel("00:00:00")
         timing_layout.addWidget(self.elapsed_label)
@@ -676,30 +679,66 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel_conversion)
 
-        self.done_button = QPushButton("Done")
-        self.done_button.clicked.connect(self.finish_conversion)
-        self.done_button.setVisible(False)
-
         button_layout = QHBoxLayout()
         button_layout.addStretch()
         button_layout.addWidget(self.pause_button)
         button_layout.addWidget(self.cancel_button)
-        button_layout.addWidget(self.done_button)
         button_layout.addStretch()
 
+        # ---- Completion panel (shown when done) ----
+        self.completion_widget = QWidget()
+        completion_layout = QVBoxLayout(self.completion_widget)
+        completion_layout.setAlignment(Qt.AlignCenter)
+        completion_layout.setSpacing(16)
+
+        complete_label = QLabel("✅ Conversion Complete!")
+        complete_label.setObjectName("completionTitle")
+        complete_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        complete_label.setAlignment(Qt.AlignCenter)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        btn_layout.setAlignment(Qt.AlignCenter)
+
+        # Folder icon
+        folder_icon_path = ICONS / "folder.svg"
+        folder_icon = QIcon(str(folder_icon_path)) if folder_icon_path.exists() else QIcon()
+        self.open_folder_btn = QPushButton(folder_icon, "Open Folder")
+        self.open_folder_btn.clicked.connect(self._open_output_folder)
+
+        # File icon
+        file_icon_path = ICONS / "file.svg"
+        file_icon = QIcon(str(file_icon_path)) if file_icon_path.exists() else QIcon()
+        self.open_file_btn = QPushButton(file_icon, "Open File")
+        self.open_file_btn.clicked.connect(self._open_output_file)
+
+        # Back button
+        self.back_btn = QPushButton("Back")
+        self.back_btn.clicked.connect(self._go_back_to_main)
+
+        btn_layout.addWidget(self.open_folder_btn)
+        btn_layout.addWidget(self.open_file_btn)
+        btn_layout.addWidget(self.back_btn)
+
+        completion_layout.addWidget(complete_label)
+        completion_layout.addLayout(btn_layout)
+        self.completion_widget.hide()
+
+        # Add all to conversion view
         conversion_layout.addStretch()
         conversion_layout.addWidget(conversion_title)
         conversion_layout.addWidget(self.current_converter_label)
         conversion_layout.addWidget(self.current_file_label)
         conversion_layout.addWidget(self.conversion_progress_bar)
         conversion_layout.addWidget(self.conversion_info_label)
-        conversion_layout.addLayout(timing_layout)
+        conversion_layout.addWidget(self.timing_container)
         conversion_layout.addLayout(button_layout)
+        conversion_layout.addWidget(self.completion_widget)
         conversion_layout.addStretch()
 
         self.content_stack.addWidget(conversion_view)
 
-        # Splitter for sidebar and content
+        # Splitter
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.sidebar)
         splitter.addWidget(self.content_stack)
@@ -709,6 +748,38 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter)
         self.setCentralWidget(root)
 
+    # ---------- Completion actions ----------
+    def _open_output_folder(self):
+        if hasattr(self, '_output_files') and self._output_files:
+            folder = str(Path(self._output_files[0]).parent)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        else:
+            QMessageBox.information(self, "No files", "No output files to open.")
+
+    def _open_output_file(self):
+        if hasattr(self, '_output_files') and self._output_files:
+            path = self._output_files[0]
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        else:
+            QMessageBox.information(self, "No files", "No output files to open.")
+
+    def _go_back_to_main(self):
+        """Return to the main file selection view."""
+        self.content_stack.setCurrentIndex(0)
+        # Reset UI elements
+        self.completion_widget.hide()
+        self.pause_button.setVisible(True)
+        self.cancel_button.setVisible(True)
+        self.current_converter_label.show()
+        self.current_file_label.show()
+        self.conversion_progress_bar.show()
+        self.conversion_info_label.show()
+        self.timing_container.show()
+        self.progress_bar.setValue(0)
+        self.conversion_progress_bar.setValue(0)
+        self.statusBar().showMessage("Ready")
+
+    # ---------- Sidebar methods ----------
     def _build_sidebar(self):
         self.sidebar.clear()
         self.category_items.clear()
@@ -963,11 +1034,44 @@ class MainWindow(QMainWindow):
                 out_dir = base.parent
 
             output_path = out_dir / base.with_suffix(converter.output_extension).name
-            if output_path.exists():
-                if overwrite == 0:
+
+            while output_path.exists():
+                if overwrite == 1:  # Overwrite
+                    break
+                elif overwrite == 2:  # Skip
+                    output_path = None
+                    break
+                elif overwrite == 0:  # Rename
                     output_path = self.get_unique_output(output_path)
-                elif overwrite == 2:
-                    continue
+                    break
+                elif overwrite == 3:  # Ask for name
+                    base_name = output_path.stem
+                    ext = output_path.suffix
+                    new_name, ok = QInputDialog.getText(
+                        self,
+                        "File exists",
+                        f"File '{output_path.name}' already exists.\nEnter a new name (without extension) or click Cancel to skip:",
+                        QLineEdit.Normal,
+                        base_name
+                    )
+                    if not ok:
+                        output_path = None
+                        break
+                    if not new_name.strip():
+                        QMessageBox.warning(self, "Invalid name", "Name cannot be empty.")
+                        continue
+                    new_path = output_path.parent / (new_name.strip() + ext)
+                    if new_path.exists():
+                        QMessageBox.warning(self, "File exists", f"'{new_path.name}' also exists. Please enter another name.")
+                        continue
+                    output_path = new_path
+                    break
+                else:
+                    break
+
+            if output_path is None:
+                continue
+
             file_pairs.append((str(input_file), str(output_path)))
         return file_pairs
 
@@ -993,13 +1097,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No converter", "Select a conversion.")
             return
 
-        # Show options dialog
         dlg = ConversionOptionsDialog(self.selected_files, converter, self)
         if dlg.exec() != QDialog.Accepted:
             return
         opts = dlg.get_options()
 
-        # Build new converter with options
         preset_args = PRESETS.get(opts.get("preset", "None"), [])
         extra_args = opts.get("extra_args", []) + preset_args
         threads = opts.get("threads", 0)
@@ -1009,13 +1111,9 @@ class MainWindow(QMainWindow):
         end_time = opts.get("end_time")
         scale = opts.get("scale")
 
-        # Codec overrides
         video_codec = opts.get("video_codec")
         audio_codec = opts.get("audio_codec")
-        # If copy_mode is True, video and audio codecs are ignored (ffmpeg will use copy)
-        # But if copy_mode is False, we can set codecs from opts
 
-        # Build extra args for quality (CRF/bitrate)
         if "crf" in opts:
             extra_args.extend(["-crf", str(opts["crf"])])
         if "video_bitrate" in opts:
@@ -1044,11 +1142,12 @@ class MainWindow(QMainWindow):
         delete_source = opts.get("delete_source", False)
         shutdown = opts.get("shutdown", False)
 
-        # Resolve output paths
         file_pairs = self.resolve_output_paths(new_converter)
         if not file_pairs:
             self.statusBar().showMessage("No files to convert (maybe skipped)")
             return
+
+        self._output_files = [pair[1] for pair in file_pairs]
 
         total_files = len(file_pairs)
         self.progress_bar.setMaximum(total_files)
@@ -1061,8 +1160,16 @@ class MainWindow(QMainWindow):
         self.conversion_info_label.setText(f"0 / {total_files} files | {self.current_speed}")
         self.pause_button.setVisible(True)
         self.cancel_button.setVisible(True)
-        self.done_button.setVisible(False)
         self.pause_button.setText("Pause")
+        self.completion_widget.hide()
+
+        # Show all progress widgets
+        self.current_converter_label.show()
+        self.current_file_label.show()
+        self.conversion_progress_bar.show()
+        self.conversion_info_label.show()
+        self.timing_container.show()
+
         self.content_stack.setCurrentIndex(1)
 
         self.current_converter_label.setText(f"Current Converter: {new_converter.name}")
@@ -1077,7 +1184,6 @@ class MainWindow(QMainWindow):
         self.converter_thread.conversion_finished.connect(self._on_conversion_finished)
         self.converter_thread.start()
 
-        # Store shutdown flag for later
         self._shutdown_after = shutdown
 
     def _update_conversion_controls(self, enabled: bool):
@@ -1117,19 +1223,37 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.pause_button.setVisible(False)
         self.cancel_button.setVisible(False)
-        self.done_button.setVisible(True)
         self.conversion_progress_bar.setValue(100)
 
         if errors:
             self.statusBar().showMessage("Error")
             self.show_notification("Conversion Errors", f"{len(errors)} files failed.")
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Conversion finished with errors")
+            msg.setText(f"{len(errors)} file(s) failed to convert.\nClick 'Show Details' to see the list.")
+            msg.setDetailedText("\n".join(errors))
+            msg.exec()
+            # Show completion panel anyway so user can go back
+            self.completion_widget.show()
+            self.current_converter_label.hide()
+            self.current_file_label.hide()
+            self.conversion_progress_bar.hide()
+            self.conversion_info_label.hide()
+            self.timing_container.hide()
         elif converted:
             self.statusBar().showMessage("Done")
             self.show_notification("Conversion Complete", f"Successfully converted {converted} file(s).")
+            # Show completion panel and hide progress widgets
+            self.completion_widget.show()
+            self.current_converter_label.hide()
+            self.current_file_label.hide()
+            self.conversion_progress_bar.hide()
+            self.conversion_info_label.hide()
+            self.timing_container.hide()
         else:
             self.statusBar().showMessage("Ready")
 
-        # Auto shutdown if checked
         if hasattr(self, '_shutdown_after') and self._shutdown_after and converted > 0:
             reply = QMessageBox.question(self, "Shutdown", "All conversions done. Shutdown computer now?",
                                          QMessageBox.Yes | QMessageBox.No)
@@ -1159,27 +1283,6 @@ class MainWindow(QMainWindow):
             self.cancel_button.setEnabled(False)
             self.pause_button.setEnabled(False)
             self.converter_thread.cancel()
-
-    def finish_conversion(self):
-        converted = self.converter_thread.converted if self.converter_thread else 0
-        errors = self.converter_thread.errors if self.converter_thread else []
-        if errors:
-            # Use a QMessageBox with detailed text (selectable & copyable)
-            msg = QMessageBox(self)
-            msg.setIcon(QMessageBox.Warning)
-            msg.setWindowTitle("Conversion finished with errors")
-            msg.setText(f"{len(errors)} file(s) failed to convert.\nClick 'Show Details' to see the list.")
-            msg.setDetailedText("\n".join(errors))
-            msg.exec()
-        elif converted:
-            QMessageBox.information(self, "Conversion complete", f"Converted {converted} file(s).")
-        self.content_stack.setCurrentIndex(0)
-        self.pause_button.setVisible(True)
-        self.cancel_button.setVisible(True)
-        self.done_button.setVisible(False)
-        self.pause_button.setText("Pause")
-        self.pause_button.clicked.disconnect()
-        self.pause_button.clicked.connect(self.pause_conversion)
 
     def show_settings(self):
         dlg = SettingsDialog(self)

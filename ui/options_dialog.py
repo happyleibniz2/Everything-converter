@@ -47,7 +47,7 @@ DEFAULT_AUDIO_CODEC = {
     ".m4a": "aac",
 }
 
-# Presets (same as main_window)
+# Presets
 PRESETS = {
     "None": [],
     "Fast (web friendly)": ["-preset", "veryfast", "-crf", "28"],
@@ -309,9 +309,8 @@ class ConversionOptionsDialog(QDialog):
                 combo.setCurrentIndex(idx)
 
     def _populate_defaults(self):
-        # Load from media info if available
         if self.media_info:
-            if "width" in self.media_info:
+            if "width" in self.media_info and hasattr(self, 'scale_width'):
                 self.scale_width.setValue(self.media_info["width"])
                 self.scale_height.setValue(self.media_info["height"])
 
@@ -343,10 +342,8 @@ class ConversionOptionsDialog(QDialog):
             self.scale_height.setEnabled(False)
 
     def get_options(self):
-        """Return a dict of all user choices."""
         opts = {}
 
-        # General
         opts["preset"] = self.preset_combo.currentText()
         opts["copy_mode"] = self.copy_mode_check.isChecked()
         opts["copy_audio"] = self.copy_audio_check.isChecked()
@@ -356,7 +353,6 @@ class ConversionOptionsDialog(QDialog):
         opts["delete_source"] = self.delete_source_check.isChecked()
         opts["shutdown"] = self.shutdown_check.isChecked()
 
-        # Video
         if self.converter.category == "Video":
             opts["video_codec"] = self.video_codec_combo.currentData()
             mode = self.quality_mode_combo.currentIndex()
@@ -371,13 +367,11 @@ class ConversionOptionsDialog(QDialog):
                 h = self.scale_height.value()
                 opts["scale"] = f"{w}:{h}" if w > 0 and h > 0 else None
 
-        # Audio
         if self.converter.category in ("Video", "Audio"):
             opts["audio_codec"] = self.audio_codec_combo.currentData()
             opts["audio_bitrate"] = self.audio_bitrate_spin.value()
             opts["sample_rate"] = int(self.sample_rate_combo.currentText())
 
-        # Extra args
         extra = self.extra_args_edit.text().strip()
         if extra:
             opts["extra_args"] = extra.split()
