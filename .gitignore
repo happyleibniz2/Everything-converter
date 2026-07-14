@@ -179,7 +179,4 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-ffmpeg/ffmpeg.exe
-ffmpeg/ffplay.exe
-ffmpeg/ffprobe.exe
 .vscode/settings.json
