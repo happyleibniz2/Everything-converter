@@ -1,395 +1,36 @@
 # ui/main_window.py
 
 import os
-import subprocess
-import time
-import shutil
 import platform
-import signal
 from pathlib import Path
-from PyQt5.QtCore import pyqtSignal, Qt, QThread, QSize, QSettings, QUrl, QTimer
+from PyQt5.QtCore import Qt, QSize, QSettings, QUrl
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QBrush, QDesktopServices
 from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar,
     QScrollArea, QStackedWidget, QStatusBar, QToolBar, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget, QGroupBox, QSpinBox,
-    QTabWidget, QTimeEdit, QButtonGroup, QRadioButton, QListWidget, QListWidgetItem,
+    QTabWidget, QListWidget, QListWidgetItem,
     QMenu, QSystemTrayIcon, QSplitter, QHeaderView, QAbstractItemView
 )
-import psutil
 import lang
 from logger import logger
 from registry import CONVERTERS, find_converters, search_converters
 from converters.extensions import EXTENSION_DESCRIPTIONS
 from system_info import APP_VERSION, BUILD_TYPE, ffmpeg_version
-from utils.paths import ICONS, RESOURCES, TEMP, LANGUAGE_EN_US
+from utils.paths import ICONS, RESOURCES
 from converters.ffmpeg_base import FFmpegConverter
 from ui.options_dialog import ConversionOptionsDialog, PRESETS, DEFAULT_VIDEO_CODEC, DEFAULT_AUDIO_CODEC
 from ui.error_assistant import ErrorAssistant
+from ui.widgets.drop_area import DropArea
+from workers.conversion_worker import BatchConversionWorker
 from utils.media_info import get_media_info
+from services.size_estimator import estimate_output_size
+from controllers.queue_controller import QueueController
 
 # ---------- Batch Conversion Worker (unchanged) ----------
-class BatchConversionWorker(QThread):
-    progress_updated = pyqtSignal(int)
-    per_file_progress = pyqtSignal(int)
-    status_message = pyqtSignal(str)
-    speed_updated = pyqtSignal(str)
-    current_file_updated = pyqtSignal(str)
-    time_updated = pyqtSignal(str, str)
-    conversion_finished = pyqtSignal(int, list)
-
-    def __init__(self, task_list, delete_source=False):
-        super().__init__()
-        self.task_list = task_list
-        self.total = len(task_list)
-        self.converted = 0
-        self.errors = []
-        self.is_paused = False
-        self.is_cancelled = False
-        self.delete_source = delete_source
-        self.current_worker = None
-        self._stop_requested = False
-
-    def pause(self):
-        self.is_paused = True
-        if self.current_worker:
-            self.current_worker.pause()
-
-    def resume(self):
-        self.is_paused = False
-        if self.current_worker:
-            self.current_worker.resume()
-
-    def cancel(self):
-        self.is_cancelled = True
-        if self.current_worker:
-            self.current_worker.cancel()
-
-    def run(self):
-        self.start_time = time.time()
-        self.bytes_processed = 0
-
-        for idx, (converter, input_file, output_file) in enumerate(self.task_list, start=1):
-            if self.is_cancelled or self._stop_requested:
-                break
-
-            while self.is_paused:
-                time.sleep(0.1)
-
-            self.current_file_updated.emit(Path(input_file).name)
-            self.status_message.emit(f"{lang.lang.get('Converting')} {idx}/{self.total}...")
-
-            worker = ConversionWorker(converter, [(input_file, output_file)], self.delete_source)
-            self.current_worker = worker
-
-            worker.per_file_progress.connect(self.per_file_progress.emit)
-            worker.speed_updated.connect(self.speed_updated.emit)
-            worker.time_updated.connect(self.time_updated.emit)
-
-            worker.start()
-            worker.wait()
-
-            if worker.errors:
-                self.errors.extend(worker.errors)
-            else:
-                self.converted += 1
-
-            self.progress_updated.emit(idx)
-            self.bytes_processed += worker.bytes_processed
-
-            if self.is_cancelled:
-                break
-
-        self.conversion_finished.emit(self.converted, self.errors)
-
-
-# ---------- ConversionWorker (unchanged) ----------
-class ConversionWorker(QThread):
-    progress_updated = pyqtSignal(int)
-    per_file_progress = pyqtSignal(int)
-    status_message = pyqtSignal(str)
-    speed_updated = pyqtSignal(str)
-    current_file_updated = pyqtSignal(str)
-    time_updated = pyqtSignal(str, str)
-    conversion_finished = pyqtSignal(int, list)
-
-    def __init__(self, converter, file_pairs, delete_source=False):
-        super().__init__()
-        self.converter = converter
-        self.file_pairs = file_pairs
-        self.converted = 0
-        self.errors = []
-        self.is_paused = False
-        self.is_cancelled = False
-        self.start_time = None
-        self.bytes_processed = 0
-        self.delete_source = delete_source
-        self.current_process = None
-
-    def pause(self):
-        self.is_paused = True
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                psutil.Process(self.current_process.pid).suspend()
-                logger.info(f"Suspended FFmpeg PID {self.current_process.pid}")
-            except Exception as e:
-                # Fallback: try POSIX signals if psutil suspend fails
-                try:
-                    if os.name == 'posix':
-                        os.kill(self.current_process.pid, signal.SIGSTOP)
-                        logger.info(f"Sent SIGSTOP to FFmpeg PID {self.current_process.pid}")
-                    else:
-                        logger.error(f"Failed to suspend FFmpeg PID {self.current_process.pid}: {e}")
-                except Exception as e2:
-                    logger.error(f"Suspend fallback failed: {e2}")
-
-    def resume(self):
-        self.is_paused = False
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                psutil.Process(self.current_process.pid).resume()
-                logger.info(f"Resumed FFmpeg PID {self.current_process.pid}")
-            except Exception as e:
-                # Fallback: try POSIX signals if psutil resume fails
-                try:
-                    if os.name == 'posix':
-                        os.kill(self.current_process.pid, signal.SIGCONT)
-                        logger.info(f"Sent SIGCONT to FFmpeg PID {self.current_process.pid}")
-                    else:
-                        logger.error(f"Failed to resume FFmpeg PID {self.current_process.pid}: {e}")
-                except Exception as e2:
-                    logger.error(f"Resume fallback failed: {e2}")
-
-    def cancel(self):
-        self.is_cancelled = True
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                proc = psutil.Process(self.current_process.pid)
-                children = proc.children(recursive=True)
-                for child in children:
-                    child.kill()
-                proc.kill()
-                proc.wait(timeout=2)
-                logger.info(f"Force-killed FFmpeg PID {self.current_process.pid}")
-            except psutil.NoSuchProcess:
-                pass
-            except Exception as e:
-                logger.warning(f"Psutil kill failed, falling back to subprocess: {e}")
-                try:
-                    self.current_process.kill()
-                    self.current_process.wait(timeout=2)
-                except Exception:
-                    pass
-
-    def run(self):
-        total_files = len(self.file_pairs)
-        self.start_time = time.time()
-
-        for index, (input_file, output_file) in enumerate(self.file_pairs, start=1):
-            if self.is_cancelled:
-                break
-
-            while self.is_paused:
-                time.sleep(0.1)
-
-            self.current_file_updated.emit(Path(input_file).name)
-            self.status_message.emit(f"{lang.lang.get('Converting')} {index}/{total_files}...")
-
-            temp_output = str(TEMP / f"temp_{Path(output_file).name}")
-            os.makedirs(os.path.dirname(temp_output), exist_ok=True)
-            moved = False
-
-            try:
-                file_size = Path(input_file).stat().st_size
-                logger.info("================================================")
-                logger.info("Conversion")
-                logger.info("Input: %s", input_file)
-                logger.info("Output: %s", output_file)
-                logger.info("Converter: %s", self.converter.name)
-                start_file = time.time()
-
-                if hasattr(self.converter, "convert_with_progress"):
-                    def _progress_cb(percent, elapsed_sec, remaining_sec):
-                        while self.is_paused:
-                            time.sleep(0.1)
-
-                        elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed_sec))
-                        remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining_sec)) if remaining_sec else "00:00:00"
-
-                        try:
-                            bytes_for_file = int(file_size * (percent / 100.0))
-                        except Exception:
-                            bytes_for_file = 0
-
-                        total_processed = self.bytes_processed + bytes_for_file
-                        total_elapsed = time.time() - self.start_time if self.start_time else elapsed_sec
-                        speed_mbps = (total_processed / (1024 * 1024)) / max(total_elapsed, 0.001)
-
-                        self.per_file_progress.emit(int(percent))
-                        self.time_updated.emit(elapsed_text, remaining_text)
-                        self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
-
-                    self.converter.convert_with_progress(
-                        input_file,
-                        temp_output,
-                        progress_callback=_progress_cb,
-                        should_cancel=lambda: self.is_cancelled,
-                        process_callback=lambda proc: setattr(self, 'current_process', proc)
-                    )
-                else:
-                    self.converter.convert(input_file, temp_output)
-
-                os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                shutil.move(temp_output, output_file)
-                moved = True
-
-                duration = time.time() - start_file
-                self.bytes_processed += file_size
-                self.converted += 1
-
-                if self.delete_source:
-                    try:
-                        os.remove(input_file)
-                        logger.info("Deleted source: %s", input_file)
-                    except Exception as e:
-                        logger.warning("Could not delete source: %s", e)
-
-                logger.info("Duration: %.2f seconds", duration)
-                logger.info("Success")
-            except Exception as exc:
-                logger.exception("Conversion failed for %s", input_file)
-                self.errors.append(f"{Path(input_file).name}: {exc}")
-                if self.is_cancelled:
-                    self.status_message.emit(lang.lang.get("Cancel"))
-                    break
-            finally:
-                if not moved and os.path.exists(temp_output):
-                    try:
-                        os.remove(temp_output)
-                        logger.info("Removed temporary file: %s", temp_output)
-                    except Exception as e:
-                        logger.warning("Failed to remove temporary file: %s", e)
-                self.current_process = None
-
-            elapsed = time.time() - self.start_time
-            remaining = 0.0
-            if index > 0 and index < total_files:
-                remaining = elapsed / index * (total_files - index)
-
-            elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining))
-
-            speed_mbps = (self.bytes_processed / (1024 * 1024)) / max(elapsed, 0.001)
-            self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
-            self.time_updated.emit(elapsed_text, remaining_text)
-            self.progress_updated.emit(index)
-            self.per_file_progress.emit(100)
-
-        self.conversion_finished.emit(self.converted, self.errors)
-
-
-# ---------- Drop Area (unchanged) ----------
-class DropArea(QFrame):
-    files_dropped = pyqtSignal(list)
-    browse_requested = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.setAcceptDrops(True)
-        self.setObjectName("dropArea")
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setCursor(Qt.PointingHandCursor)
-
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(12)
-
-        self.icon_label = QLabel()
-        self.icon_label.setAlignment(Qt.AlignCenter)
-        self.icon_label.setObjectName("dropIcon")
-        self.set_icon(None)
-
-        self.title_label = QLabel(lang.lang.get("Drop files here"))
-        self.title_label.setAlignment(Qt.AlignCenter)
-        self.title_label.setObjectName("dropTitle")
-
-        or_label = QLabel(lang.lang.get("or"))
-        or_label.setAlignment(Qt.AlignCenter)
-
-        self.browse_label = QLabel(lang.lang.get("Click to browse"))
-        self.browse_label.setAlignment(Qt.AlignCenter)
-        self.browse_label.setObjectName("browseLabel")
-
-        layout.addWidget(self.icon_label)
-        layout.addWidget(self.title_label)
-        layout.addWidget(or_label)
-        layout.addWidget(self.browse_label)
-
-    def set_icon(self, category):
-        icon_map = {
-            "Image": "image.svg",
-            "Video": "video.svg",
-            "Audio": "audio.svg",
-            "PDF": "pdf.svg",
-            "Archives": "archive.svg",
-            "Office": "office.svg",
-            "Favorites": "favorite.svg",
-        }
-        if category and category in icon_map:
-            icon_name = icon_map[category]
-        else:
-            icon_name = "image.svg"
-
-        icon_path = ICONS / icon_name
-        if icon_path.exists():
-            renderer = QSvgRenderer(str(icon_path))
-            if renderer.isValid():
-                pixmap = QPixmap(64, 64)
-                pixmap.fill(Qt.transparent)
-                painter = QPainter(pixmap)
-                renderer.render(painter)
-                painter.end()
-                self.icon_label.setPixmap(pixmap)
-                return
-
-        icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
-        if not icon.isNull():
-            self.icon_label.setPixmap(icon.pixmap(64, 64))
-        else:
-            self.icon_label.clear()
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        if files:
-            self.files_dropped.emit(files)
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.browse_requested.emit()
-        super().mousePressEvent(event)
-
-    def retranslate(self):
-        self.title_label.setText(lang.lang.get("Drop files here"))
-        self.browse_label.setText(lang.lang.get("Click to browse"))
-        # "or" label is not stored as attribute, find it
-        for child in self.children():
-            if isinstance(child, QLabel) and child.objectName() != "dropTitle" and child.objectName() != "browseLabel" and child.objectName() != "dropIcon":
-                child.setText(lang.lang.get("or"))
-
-
-# ---------- Settings Dialog ----------
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -608,7 +249,7 @@ class MainWindow(QMainWindow):
         self.converter_thread = None
         self.current_speed = "0.00 MB/s"
         self._output_files = []
-        self._queued_file_keys = set()
+        self.queue_controller = QueueController()
         self._row_options = {}
         self._is_conversion_paused = False
 
@@ -1148,7 +789,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.file_table.setRowCount(0)
-            self._queued_file_keys.clear()
+            self.queue_controller.clear()
             self.drop_area.setVisible(True)
             self.statusBar().showMessage(lang.lang.get("Queue cleared"))
 
@@ -1159,14 +800,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{self.file_table.rowCount()} {lang.lang.get('file(s) in queue')}")
 
     def _add_file_to_table(self, file_path):
-        normalized_key = os.path.abspath(file_path)
-        if normalized_key in self._queued_file_keys:
+        if not self.queue_controller.add(file_path):
             self.statusBar().showMessage(lang.lang.get("File already in queue"))
             return
 
         row = self.file_table.rowCount()
         self.file_table.insertRow(row)
-        self._queued_file_keys.add(normalized_key)
 
         name_item = QTableWidgetItem(Path(file_path).name)
         name_item.setData(Qt.UserRole, file_path)
@@ -1244,31 +883,17 @@ class MainWindow(QMainWindow):
         size = Path(file_path).stat().st_size if Path(file_path).exists() else 0
         if not size:
             return "—"
-        info = get_media_info(file_path) or {}
-        duration = float(info.get("duration") or 0)
-        video_bitrate = opts.get("video_bitrate")
-        audio_bitrate = opts.get("audio_bitrate") or info.get("audio_bitrate")
-        if duration and (video_bitrate or audio_bitrate):
-            total_kbps = int(video_bitrate or 0) + int(audio_bitrate or 0)
-            estimated = total_kbps * 1000 * duration / 8
-            confidence = "★★★★☆"
-        else:
-            preset = opts.get("preset", self.settings.value("default_preset", "None", type=str))
-            ratio_ranges = {
-                "Lossless (large)": (2.0, 5.0, "★★☆☆☆"),
-                "High Quality (local)": (0.9, 1.2, "★★★☆☆"),
-                "Fast (web friendly)": (0.7, 0.9, "★★★☆☆"),
-                "Small Size (mobile)": (0.2, 0.4, "★★★☆☆"),
-                "None": (0.7, 1.0, "★★☆☆☆"),
-            }
-            lo, hi, confidence = ratio_ranges.get(preset, ratio_ranges["None"])
-            target_ext = converter.output_extension.lower() if converter else ""
-            if target_ext in {".hevc", ".h265"} or opts.get("video_codec") == "libx265":
-                lo, hi = min(lo, 0.6), min(hi, 0.8)
-            estimated = size * ((lo + hi) / 2)
-        saved = max(0, size - estimated)
-        percent = (saved / size * 100) if size else 0
-        return f"≈{self._format_size(estimated)} | Save {self._format_size(saved)} ({percent:.0f}%) {confidence}"
+        estimate = estimate_output_size(
+            file_path,
+            converter,
+            opts,
+            default_preset=self.settings.value("default_preset", "None", type=str),
+        )
+        return (
+            f"≈{self._format_size(estimate['estimated'])} | "
+            f"Save {self._format_size(estimate['saved'])} "
+            f"({estimate['percent']:.0f}%) {estimate['confidence']}"
+        )
 
     def _refresh_row_estimate(self, row):
         if row < 0 or row >= self.file_table.rowCount():
@@ -1584,7 +1209,7 @@ class MainWindow(QMainWindow):
         elif action == remove_action:
             item = self.file_table.item(row, 0)
             if item:
-                self._queued_file_keys.discard(os.path.abspath(item.data(Qt.UserRole)))
+                self.queue_controller.discard(item.data(Qt.UserRole))
             self.file_table.removeRow(row)
         elif action == open_folder_action:
             self._open_output_folder()
