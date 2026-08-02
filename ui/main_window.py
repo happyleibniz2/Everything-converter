@@ -1,605 +1,38 @@
 # ui/main_window.py
 
 import os
-import subprocess
-import time
-import shutil
-import platform
-import signal
 from pathlib import Path
-from PyQt5.QtCore import pyqtSignal, Qt, QThread, QSize, QSettings, QUrl, QTimer
+from PyQt5.QtCore import Qt, QSize, QSettings, QUrl
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QBrush, QDesktopServices
 from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QAction, QApplication, QComboBox, QDialog, QFileDialog,
+    QFrame, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar,
     QScrollArea, QStackedWidget, QStatusBar, QToolBar, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget, QGroupBox, QSpinBox,
-    QTabWidget, QTimeEdit, QButtonGroup, QRadioButton, QListWidget, QListWidgetItem,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem,
     QMenu, QSystemTrayIcon, QSplitter, QHeaderView, QAbstractItemView
 )
-import psutil
 import lang
 from logger import logger
 from registry import CONVERTERS, find_converters, search_converters
 from converters.extensions import EXTENSION_DESCRIPTIONS
-from system_info import APP_VERSION, BUILD_TYPE, ffmpeg_version
-from utils.paths import ICONS, RESOURCES, TEMP, LANGUAGE_EN_US
+from utils.paths import ICONS, RESOURCES
 from converters.ffmpeg_base import FFmpegConverter
 from ui.options_dialog import ConversionOptionsDialog, PRESETS, DEFAULT_VIDEO_CODEC, DEFAULT_AUDIO_CODEC
+from ui.dialogs.settings_dialog import SettingsDialog
+from ui.dialogs.about_dialog import AboutDialog
 from ui.error_assistant import ErrorAssistant
+from ui.widgets.drop_area import DropArea
+from workers.conversion_worker import BatchConversionWorker
 from utils.media_info import get_media_info
+from services.size_estimator import estimate_output_size
+from controllers.queue_controller import QueueController
+from utils.formatter import format_short_duration, format_size
+from utils.output_builder import build_output_path
 
-# ---------- Batch Conversion Worker (unchanged) ----------
-class BatchConversionWorker(QThread):
-    progress_updated = pyqtSignal(int)
-    per_file_progress = pyqtSignal(int)
-    status_message = pyqtSignal(str)
-    speed_updated = pyqtSignal(str)
-    current_file_updated = pyqtSignal(str)
-    time_updated = pyqtSignal(str, str)
-    conversion_finished = pyqtSignal(int, list)
 
-    def __init__(self, task_list, delete_source=False):
-        super().__init__()
-        self.task_list = task_list
-        self.total = len(task_list)
-        self.converted = 0
-        self.errors = []
-        self.is_paused = False
-        self.is_cancelled = False
-        self.delete_source = delete_source
-        self.current_worker = None
-        self._stop_requested = False
-
-    def pause(self):
-        self.is_paused = True
-        if self.current_worker:
-            self.current_worker.pause()
-
-    def resume(self):
-        self.is_paused = False
-        if self.current_worker:
-            self.current_worker.resume()
-
-    def cancel(self):
-        self.is_cancelled = True
-        if self.current_worker:
-            self.current_worker.cancel()
-
-    def run(self):
-        self.start_time = time.time()
-        self.bytes_processed = 0
-
-        for idx, (converter, input_file, output_file) in enumerate(self.task_list, start=1):
-            if self.is_cancelled or self._stop_requested:
-                break
-
-            while self.is_paused:
-                time.sleep(0.1)
-
-            self.current_file_updated.emit(Path(input_file).name)
-            self.status_message.emit(f"{lang.lang.get('Converting')} {idx}/{self.total}...")
-
-            worker = ConversionWorker(converter, [(input_file, output_file)], self.delete_source)
-            self.current_worker = worker
-
-            worker.per_file_progress.connect(self.per_file_progress.emit)
-            worker.speed_updated.connect(self.speed_updated.emit)
-            worker.time_updated.connect(self.time_updated.emit)
-
-            worker.start()
-            worker.wait()
-
-            if worker.errors:
-                self.errors.extend(worker.errors)
-            else:
-                self.converted += 1
-
-            self.progress_updated.emit(idx)
-            self.bytes_processed += worker.bytes_processed
-
-            if self.is_cancelled:
-                break
-
-        self.conversion_finished.emit(self.converted, self.errors)
-
-
-# ---------- ConversionWorker (unchanged) ----------
-class ConversionWorker(QThread):
-    progress_updated = pyqtSignal(int)
-    per_file_progress = pyqtSignal(int)
-    status_message = pyqtSignal(str)
-    speed_updated = pyqtSignal(str)
-    current_file_updated = pyqtSignal(str)
-    time_updated = pyqtSignal(str, str)
-    conversion_finished = pyqtSignal(int, list)
-
-    def __init__(self, converter, file_pairs, delete_source=False):
-        super().__init__()
-        self.converter = converter
-        self.file_pairs = file_pairs
-        self.converted = 0
-        self.errors = []
-        self.is_paused = False
-        self.is_cancelled = False
-        self.start_time = None
-        self.bytes_processed = 0
-        self.delete_source = delete_source
-        self.current_process = None
-
-    def pause(self):
-        self.is_paused = True
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                psutil.Process(self.current_process.pid).suspend()
-                logger.info(f"Suspended FFmpeg PID {self.current_process.pid}")
-            except Exception as e:
-                # Fallback: try POSIX signals if psutil suspend fails
-                try:
-                    if os.name == 'posix':
-                        os.kill(self.current_process.pid, signal.SIGSTOP)
-                        logger.info(f"Sent SIGSTOP to FFmpeg PID {self.current_process.pid}")
-                    else:
-                        logger.error(f"Failed to suspend FFmpeg PID {self.current_process.pid}: {e}")
-                except Exception as e2:
-                    logger.error(f"Suspend fallback failed: {e2}")
-
-    def resume(self):
-        self.is_paused = False
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                psutil.Process(self.current_process.pid).resume()
-                logger.info(f"Resumed FFmpeg PID {self.current_process.pid}")
-            except Exception as e:
-                # Fallback: try POSIX signals if psutil resume fails
-                try:
-                    if os.name == 'posix':
-                        os.kill(self.current_process.pid, signal.SIGCONT)
-                        logger.info(f"Sent SIGCONT to FFmpeg PID {self.current_process.pid}")
-                    else:
-                        logger.error(f"Failed to resume FFmpeg PID {self.current_process.pid}: {e}")
-                except Exception as e2:
-                    logger.error(f"Resume fallback failed: {e2}")
-
-    def cancel(self):
-        self.is_cancelled = True
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                proc = psutil.Process(self.current_process.pid)
-                children = proc.children(recursive=True)
-                for child in children:
-                    child.kill()
-                proc.kill()
-                proc.wait(timeout=2)
-                logger.info(f"Force-killed FFmpeg PID {self.current_process.pid}")
-            except psutil.NoSuchProcess:
-                pass
-            except Exception as e:
-                logger.warning(f"Psutil kill failed, falling back to subprocess: {e}")
-                try:
-                    self.current_process.kill()
-                    self.current_process.wait(timeout=2)
-                except Exception:
-                    pass
-
-    def run(self):
-        total_files = len(self.file_pairs)
-        self.start_time = time.time()
-
-        for index, (input_file, output_file) in enumerate(self.file_pairs, start=1):
-            if self.is_cancelled:
-                break
-
-            while self.is_paused:
-                time.sleep(0.1)
-
-            self.current_file_updated.emit(Path(input_file).name)
-            self.status_message.emit(f"{lang.lang.get('Converting')} {index}/{total_files}...")
-
-            temp_output = str(TEMP / f"temp_{Path(output_file).name}")
-            os.makedirs(os.path.dirname(temp_output), exist_ok=True)
-            moved = False
-
-            try:
-                file_size = Path(input_file).stat().st_size
-                logger.info("================================================")
-                logger.info("Conversion")
-                logger.info("Input: %s", input_file)
-                logger.info("Output: %s", output_file)
-                logger.info("Converter: %s", self.converter.name)
-                start_file = time.time()
-
-                if hasattr(self.converter, "convert_with_progress"):
-                    def _progress_cb(percent, elapsed_sec, remaining_sec):
-                        while self.is_paused:
-                            time.sleep(0.1)
-
-                        elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed_sec))
-                        remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining_sec)) if remaining_sec else "00:00:00"
-
-                        try:
-                            bytes_for_file = int(file_size * (percent / 100.0))
-                        except Exception:
-                            bytes_for_file = 0
-
-                        total_processed = self.bytes_processed + bytes_for_file
-                        total_elapsed = time.time() - self.start_time if self.start_time else elapsed_sec
-                        speed_mbps = (total_processed / (1024 * 1024)) / max(total_elapsed, 0.001)
-
-                        self.per_file_progress.emit(int(percent))
-                        self.time_updated.emit(elapsed_text, remaining_text)
-                        self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
-
-                    self.converter.convert_with_progress(
-                        input_file,
-                        temp_output,
-                        progress_callback=_progress_cb,
-                        should_cancel=lambda: self.is_cancelled,
-                        process_callback=lambda proc: setattr(self, 'current_process', proc)
-                    )
-                else:
-                    self.converter.convert(input_file, temp_output)
-
-                os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                shutil.move(temp_output, output_file)
-                moved = True
-
-                duration = time.time() - start_file
-                self.bytes_processed += file_size
-                self.converted += 1
-
-                if self.delete_source:
-                    try:
-                        os.remove(input_file)
-                        logger.info("Deleted source: %s", input_file)
-                    except Exception as e:
-                        logger.warning("Could not delete source: %s", e)
-
-                logger.info("Duration: %.2f seconds", duration)
-                logger.info("Success")
-            except Exception as exc:
-                logger.exception("Conversion failed for %s", input_file)
-                self.errors.append(f"{Path(input_file).name}: {exc}")
-                if self.is_cancelled:
-                    self.status_message.emit(lang.lang.get("Cancel"))
-                    break
-            finally:
-                if not moved and os.path.exists(temp_output):
-                    try:
-                        os.remove(temp_output)
-                        logger.info("Removed temporary file: %s", temp_output)
-                    except Exception as e:
-                        logger.warning("Failed to remove temporary file: %s", e)
-                self.current_process = None
-
-            elapsed = time.time() - self.start_time
-            remaining = 0.0
-            if index > 0 and index < total_files:
-                remaining = elapsed / index * (total_files - index)
-
-            elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining))
-
-            speed_mbps = (self.bytes_processed / (1024 * 1024)) / max(elapsed, 0.001)
-            self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
-            self.time_updated.emit(elapsed_text, remaining_text)
-            self.progress_updated.emit(index)
-            self.per_file_progress.emit(100)
-
-        self.conversion_finished.emit(self.converted, self.errors)
-
-
-# ---------- Drop Area (unchanged) ----------
-class DropArea(QFrame):
-    files_dropped = pyqtSignal(list)
-    browse_requested = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.setAcceptDrops(True)
-        self.setObjectName("dropArea")
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setCursor(Qt.PointingHandCursor)
-
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(12)
-
-        self.icon_label = QLabel()
-        self.icon_label.setAlignment(Qt.AlignCenter)
-        self.icon_label.setObjectName("dropIcon")
-        self.set_icon(None)
-
-        self.title_label = QLabel(lang.lang.get("Drop files here"))
-        self.title_label.setAlignment(Qt.AlignCenter)
-        self.title_label.setObjectName("dropTitle")
-
-        or_label = QLabel(lang.lang.get("or"))
-        or_label.setAlignment(Qt.AlignCenter)
-
-        self.browse_label = QLabel(lang.lang.get("Click to browse"))
-        self.browse_label.setAlignment(Qt.AlignCenter)
-        self.browse_label.setObjectName("browseLabel")
-
-        layout.addWidget(self.icon_label)
-        layout.addWidget(self.title_label)
-        layout.addWidget(or_label)
-        layout.addWidget(self.browse_label)
-
-    def set_icon(self, category):
-        icon_map = {
-            "Image": "image.svg",
-            "Video": "video.svg",
-            "Audio": "audio.svg",
-            "PDF": "pdf.svg",
-            "Archives": "archive.svg",
-            "Office": "office.svg",
-            "Favorites": "favorite.svg",
-        }
-        if category and category in icon_map:
-            icon_name = icon_map[category]
-        else:
-            icon_name = "image.svg"
-
-        icon_path = ICONS / icon_name
-        if icon_path.exists():
-            renderer = QSvgRenderer(str(icon_path))
-            if renderer.isValid():
-                pixmap = QPixmap(64, 64)
-                pixmap.fill(Qt.transparent)
-                painter = QPainter(pixmap)
-                renderer.render(painter)
-                painter.end()
-                self.icon_label.setPixmap(pixmap)
-                return
-
-        icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
-        if not icon.isNull():
-            self.icon_label.setPixmap(icon.pixmap(64, 64))
-        else:
-            self.icon_label.clear()
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        if files:
-            self.files_dropped.emit(files)
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.browse_requested.emit()
-        super().mousePressEvent(event)
-
-    def retranslate(self):
-        self.title_label.setText(lang.lang.get("Drop files here"))
-        self.browse_label.setText(lang.lang.get("Click to browse"))
-        # "or" label is not stored as attribute, find it
-        for child in self.children():
-            if isinstance(child, QLabel) and child.objectName() != "dropTitle" and child.objectName() != "browseLabel" and child.objectName() != "dropIcon":
-                child.setText(lang.lang.get("or"))
-
-
-# ---------- Settings Dialog ----------
-class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.parent_window = parent
-        self.settings = QSettings("EverythingConverter", "Settings")
-        self.setWindowTitle(lang.lang.get("Settings"))
-        self.resize(500, 450)
-        self.init_ui()
-        self.load_settings()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
-
-        general_widget = QWidget()
-        general_layout = QFormLayout(general_widget)
-
-        self.dark_mode_checkbox = QCheckBox(lang.lang.get("Dark mode"))
-        self.follow_system_checkbox = QCheckBox(lang.lang.get("Follow system"))
-        general_layout.addRow(self.dark_mode_checkbox, self.follow_system_checkbox)
-
-        self.output_folder_combo = QComboBox()
-        self.output_folder_combo.addItems([lang.lang.get("Same folder"), lang.lang.get("Ask every time"), lang.lang.get("Custom folder")])
-        general_layout.addRow(lang.lang.get("Output Folder"), self.output_folder_combo)
-
-        self.custom_folder_edit = QLineEdit()
-        self.custom_folder_edit.setPlaceholderText(lang.lang.get("Path to custom output folder"))
-        browse_btn = QPushButton(lang.lang.get("Browse"))
-        browse_btn.clicked.connect(self.browse_custom_folder)
-        folder_layout = QHBoxLayout()
-        folder_layout.addWidget(self.custom_folder_edit)
-        folder_layout.addWidget(browse_btn)
-        general_layout.addRow(lang.lang.get("Custom Path"), folder_layout)
-
-        self.language_combo = QComboBox()
-        self.language_combo.addItem("English", "en_US")
-        self.language_combo.addItem("中文", "zh_CN")
-        self.language_combo.addItem("日本語", "ja_JP")
-        general_layout.addRow(lang.lang.get("Language"), self.language_combo)
-
-        self.overwrite_combo = QComboBox()
-        self.overwrite_combo.addItems([lang.lang.get("Rename"), lang.lang.get("Overwrite"), lang.lang.get("Skip"), lang.lang.get("Ask for name")])
-        general_layout.addRow(lang.lang.get("Overwrite behavior"), self.overwrite_combo)
-
-        self.logging_combo = QComboBox()
-        self.logging_combo.addItems([lang.lang.get("Verbose"), lang.lang.get("Normal"), lang.lang.get("Silent")])
-        general_layout.addRow(lang.lang.get("Logging"), self.logging_combo)
-
-        tabs.addTab(general_widget, lang.lang.get("General"))
-
-        adv_widget = QWidget()
-        adv_layout = QFormLayout(adv_widget)
-
-        self.thread_spin = QSpinBox()
-        self.thread_spin.setRange(0, 64)
-        self.thread_spin.setSpecialValueText("Auto")
-        self.thread_spin.setToolTip(lang.lang.get("0 = auto (no -threads), 1-64 = limit"))
-        adv_layout.addRow(lang.lang.get("Max threads"), self.thread_spin)
-
-        self.shutdown_check = QCheckBox(lang.lang.get("Shutdown after conversion"))
-        adv_layout.addRow(self.shutdown_check)
-
-        self.delete_source_check = QCheckBox(lang.lang.get("Delete source after conversion"))
-        adv_layout.addRow(self.delete_source_check)
-
-        self.temp_dir_edit = QLineEdit()
-        self.temp_dir_edit.setPlaceholderText(lang.lang.get("Temporary folder (leave empty for system temp)"))
-        adv_layout.addRow(lang.lang.get("Temp folder"), self.temp_dir_edit)
-
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(list(PRESETS.keys()))
-        adv_layout.addRow(lang.lang.get("Default Preset"), self.preset_combo)
-
-        tabs.addTab(adv_widget, lang.lang.get("Advanced"))
-
-        close_btn = QPushButton(lang.lang.get("Close"))
-        close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn, alignment=Qt.AlignRight)
-
-    def browse_custom_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, lang.lang.get("Select output folder"))
-        if folder:
-            self.custom_folder_edit.setText(folder)
-
-    def load_settings(self):
-        self.dark_mode_checkbox.setChecked(self.settings.value("dark_mode", False, type=bool))
-        self.follow_system_checkbox.setChecked(self.settings.value("follow_system", True, type=bool))
-        self.output_folder_combo.setCurrentIndex(self.settings.value("output_folder_mode", 0, type=int))
-        self.custom_folder_edit.setText(self.settings.value("custom_folder", "", type=str))
-        lang_code = self.settings.value("language", "en_US", type=str)
-        idx = self.language_combo.findData(lang_code)
-        if idx >= 0:
-            self.language_combo.setCurrentIndex(idx)
-        self.overwrite_combo.setCurrentIndex(self.settings.value("overwrite_behavior", 0, type=int))
-        self.logging_combo.setCurrentIndex(self.settings.value("logging", 1, type=int))
-        self.thread_spin.setValue(self.settings.value("threads", 0, type=int))
-        self.shutdown_check.setChecked(self.settings.value("shutdown_after", False, type=bool))
-        self.delete_source_check.setChecked(self.settings.value("delete_source", False, type=bool))
-        self.temp_dir_edit.setText(self.settings.value("temp_dir", "", type=str))
-        preset_idx = self.preset_combo.findText(self.settings.value("default_preset", "None", type=str))
-        if preset_idx >= 0:
-            self.preset_combo.setCurrentIndex(preset_idx)
-
-    def save_settings(self):
-        self.settings.setValue("dark_mode", self.dark_mode_checkbox.isChecked())
-        self.settings.setValue("follow_system", self.follow_system_checkbox.isChecked())
-        self.settings.setValue("output_folder_mode", self.output_folder_combo.currentIndex())
-        self.settings.setValue("custom_folder", self.custom_folder_edit.text())
-        lang_code = self.language_combo.currentData()
-        self.settings.setValue("language", lang_code)
-        self.settings.setValue("overwrite_behavior", self.overwrite_combo.currentIndex())
-        self.settings.setValue("logging", self.logging_combo.currentIndex())
-        self.settings.setValue("threads", self.thread_spin.value())
-        self.settings.setValue("shutdown_after", self.shutdown_check.isChecked())
-        self.settings.setValue("delete_source", self.delete_source_check.isChecked())
-        self.settings.setValue("temp_dir", self.temp_dir_edit.text())
-        self.settings.setValue("default_preset", self.preset_combo.currentText())
-
-    def accept(self):
-        self.save_settings()
-        # Reload language in global lang
-        lang_code = self.language_combo.currentData()
-        lang.lang.load_language(lang_code)
-        # Retranslate main window and this dialog
-        if self.parent_window:
-            self.parent_window.retranslate_ui()
-        self.retranslate_ui()
-        super().accept()
-
-    def retranslate_ui(self):
-        self.setWindowTitle(lang.lang.get("Settings"))
-        # Update combo box items
-        output_mode = self.output_folder_combo.currentIndex()
-        overwrite_mode = self.overwrite_combo.currentIndex()
-        logging_mode = self.logging_combo.currentIndex()
-        language_data = self.language_combo.currentData()
-        preset_text = self.preset_combo.currentText()
-
-        self.output_folder_combo.clear()
-        self.output_folder_combo.addItems([lang.lang.get("Same folder"), lang.lang.get("Ask every time"), lang.lang.get("Custom folder")])
-        self.output_folder_combo.setCurrentIndex(min(output_mode, self.output_folder_combo.count() - 1))
-
-        self.overwrite_combo.clear()
-        self.overwrite_combo.addItems([lang.lang.get("Rename"), lang.lang.get("Overwrite"), lang.lang.get("Skip"), lang.lang.get("Ask for name")])
-        self.overwrite_combo.setCurrentIndex(min(overwrite_mode, self.overwrite_combo.count() - 1))
-
-        self.logging_combo.clear()
-        self.logging_combo.addItems([lang.lang.get("Verbose"), lang.lang.get("Normal"), lang.lang.get("Silent")])
-        self.logging_combo.setCurrentIndex(min(logging_mode, self.logging_combo.count() - 1))
-
-        self.dark_mode_checkbox.setText(lang.lang.get("Dark mode"))
-        self.follow_system_checkbox.setText(lang.lang.get("Follow system"))
-        self.custom_folder_edit.setPlaceholderText(lang.lang.get("Path to custom output folder"))
-        # Find browse button
-        for child in self.findChildren(QPushButton):
-            if child.text() == "Browse" or child.text() == "浏览" or child.text() == "参照":
-                child.setText(lang.lang.get("Browse"))
-        # Tab titles
-        tabs = self.findChild(QTabWidget)
-        if tabs:
-            tabs.setTabText(0, lang.lang.get("General"))
-            tabs.setTabText(1, lang.lang.get("Advanced"))
-        # Advanced group
-        self.thread_spin.setToolTip(lang.lang.get("0 = auto (no -threads), 1-64 = limit"))
-        self.shutdown_check.setText(lang.lang.get("Shutdown after conversion"))
-        self.delete_source_check.setText(lang.lang.get("Delete source after conversion"))
-        self.temp_dir_edit.setPlaceholderText(lang.lang.get("Temporary folder (leave empty for system temp)"))
-        # close button
-        for btn in self.findChildren(QPushButton):
-            if btn.text() in ("Close", "关闭", "閉じる"):
-                btn.setText(lang.lang.get("Close"))
-
-        if language_data is not None:
-            idx = self.language_combo.findData(language_data)
-            if idx >= 0:
-                self.language_combo.setCurrentIndex(idx)
-        preset_idx = self.preset_combo.findText(preset_text)
-        if preset_idx >= 0:
-            self.preset_combo.setCurrentIndex(preset_idx)
-
-    # ---------- About Dialog (unchanged, can add translation later) ----------
-class AboutDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(lang.lang.get("About Everything Converter"))
-        self.resize(420, 320)
-
-        layout = QFormLayout(self)
-        title = QLabel(f"<b>{lang.lang.get('EverythingConverter')}</b>")
-        title.setTextFormat(Qt.RichText)
-        layout.addRow(title)
-        layout.addRow(lang.lang.get("Version"), QLabel(APP_VERSION))
-        layout.addRow(lang.lang.get("Build"), QLabel(BUILD_TYPE))
-        layout.addRow(lang.lang.get("Python"), QLabel(platform.python_version()))
-        from PyQt5.QtCore import QT_VERSION_STR
-        layout.addRow(lang.lang.get("Qt"), QLabel(QT_VERSION_STR))
-        layout.addRow(lang.lang.get("FFmpeg"), QLabel(ffmpeg_version()))
-        homepage = QLabel('<a href="https://example.com">https://example.com</a>')
-        homepage.setOpenExternalLinks(True)
-        layout.addRow(lang.lang.get("Homepage"), homepage)
-        layout.addRow(lang.lang.get("License"), QLabel("MIT"))
-
-        close_button = QPushButton(lang.lang.get("Close"))
-        close_button.clicked.connect(self.accept)
-        layout.addRow(close_button)
-
-
-# ---------- Main Window ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -608,7 +41,7 @@ class MainWindow(QMainWindow):
         self.converter_thread = None
         self.current_speed = "0.00 MB/s"
         self._output_files = []
-        self._queued_file_keys = set()
+        self.queue_controller = QueueController()
         self._row_options = {}
         self._is_conversion_paused = False
 
@@ -832,11 +265,12 @@ class MainWindow(QMainWindow):
         file_queue_layout.addWidget(self.add_file_btn)
         file_queue_layout.addWidget(self.clear_all_btn)
 
-        self.file_table = QTableWidget(0, 5)
+        self.file_table = QTableWidget(0, 6)
         self.file_table.setHorizontalHeaderLabels([
             lang.lang.get("Filename"),
             lang.lang.get("Target"),
             lang.lang.get("Metadata"),
+            lang.lang.get("Estimate"),
             lang.lang.get("Status"),
             lang.lang.get("Options")
         ])
@@ -844,8 +278,9 @@ class MainWindow(QMainWindow):
         self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.file_table.setColumnWidth(1, 190)
         self.file_table.setColumnWidth(2, 240)
-        self.file_table.setColumnWidth(3, 140)
-        self.file_table.setColumnWidth(4, 72)
+        self.file_table.setColumnWidth(3, 190)
+        self.file_table.setColumnWidth(4, 140)
+        self.file_table.setColumnWidth(5, 72)
         self.file_table.verticalHeader().setVisible(False)
         self.file_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1146,7 +581,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.file_table.setRowCount(0)
-            self._queued_file_keys.clear()
+            self.queue_controller.clear()
             self.drop_area.setVisible(True)
             self.statusBar().showMessage(lang.lang.get("Queue cleared"))
 
@@ -1157,14 +592,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{self.file_table.rowCount()} {lang.lang.get('file(s) in queue')}")
 
     def _add_file_to_table(self, file_path):
-        normalized_key = os.path.abspath(file_path)
-        if normalized_key in self._queued_file_keys:
+        if not self.queue_controller.add(file_path):
             self.statusBar().showMessage(lang.lang.get("File already in queue"))
             return
 
         row = self.file_table.rowCount()
         self.file_table.insertRow(row)
-        self._queued_file_keys.add(normalized_key)
 
         name_item = QTableWidgetItem(Path(file_path).name)
         name_item.setData(Qt.UserRole, file_path)
@@ -1184,14 +617,19 @@ class MainWindow(QMainWindow):
         metadata = self._format_queue_metadata(file_path)
         self.file_table.setItem(row, 2, QTableWidgetItem(metadata))
 
+        estimate_item = QTableWidgetItem(self._estimate_output_size_text(file_path, combo.currentData() if converters else None, {}))
+        self.file_table.setItem(row, 3, estimate_item)
+
         status_item = QTableWidgetItem("🟢 Ready")
         status_item.setTextAlignment(Qt.AlignCenter)
-        self.file_table.setItem(row, 3, status_item)
+        self.file_table.setItem(row, 4, status_item)
+
+        combo.currentIndexChanged.connect(lambda _idx, r=row: self._refresh_row_estimate(r))
 
         options_btn = QPushButton("⚙")
         options_btn.setFixedSize(32, 24)
         options_btn.clicked.connect(lambda _, r=row: self._open_row_options(r))
-        self.file_table.setCellWidget(row, 4, options_btn)
+        self.file_table.setCellWidget(row, 5, options_btn)
 
         self._row_options[row] = {}
         self._update_queue_preview()
@@ -1209,7 +647,7 @@ class MainWindow(QMainWindow):
         if info.get("fps"):
             parts.append(f"{float(info['fps']):.0f} FPS")
         if info.get("duration"):
-            parts.append(self._format_short_duration(info["duration"]))
+            parts.append(format_short_duration(info["duration"]))
         if info.get("audio_codec"):
             parts.append(info["audio_codec"].upper())
         if info.get("sample_rate"):
@@ -1227,31 +665,39 @@ class MainWindow(QMainWindow):
             elif ext in {".mp3", ".flac", ".wav", ".ogg", ".aac", ".m4a"}:
                 parts.append(Path(file_path).suffix.upper().lstrip("."))
             elif size:
-                parts.append(self._format_size(size))
+                parts.append(format_size(size))
             else:
                 parts.append("—")
 
         return " | ".join(parts) if parts else "—"
 
-    def _format_short_duration(self, seconds):
-        seconds = float(seconds or 0)
-        if seconds <= 0:
+    def _estimate_output_size_text(self, file_path, converter, opts):
+        size = Path(file_path).stat().st_size if Path(file_path).exists() else 0
+        if not size:
             return "—"
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        if seconds < 3600:
-            m, s = divmod(seconds, 60)
-            return f"{int(m):02d}:{int(s):02d}"
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+        estimate = estimate_output_size(
+            file_path,
+            converter,
+            opts,
+            default_preset=self.settings.value("default_preset", "None", type=str),
+        )
+        return (
+            f"≈{format_size(estimate['estimated'])} | "
+            f"Save {format_size(estimate['saved'])} "
+            f"({estimate['percent']:.0f}%) {estimate['confidence']}"
+        )
 
-    def _format_size(self, size):
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024.0 or unit == "TB":
-                return f"{size:.1f} {unit}"
-            size /= 1024.0
-        return f"{size:.1f} TB"
+    def _refresh_row_estimate(self, row):
+        if row < 0 or row >= self.file_table.rowCount():
+            return
+        item = self.file_table.item(row, 0)
+        combo = self.file_table.cellWidget(row, 1)
+        if not item or not combo:
+            return
+        self.file_table.setItem(row, 3, QTableWidgetItem(
+            self._estimate_output_size_text(item.data(Qt.UserRole), combo.currentData(), self._row_options.get(row, {}))
+        ))
+        self._update_queue_preview()
 
     def _open_row_options(self, row):
         file_path = self.file_table.item(row, 0).data(Qt.UserRole)
@@ -1266,6 +712,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             opts = dlg.get_options()
             self._row_options[row] = opts
+            self._refresh_row_estimate(row)
             self._update_queue_preview()
 
     def _open_selected_row_options(self):
@@ -1282,7 +729,7 @@ class MainWindow(QMainWindow):
             if converter is None:
                 self.destination_label.setText(lang.lang.get("Destination path will appear after selecting a conversion"))
                 return
-            preview = self._build_output_path(file_path, converter.output_extension)
+            preview = build_output_path(file_path, converter.output_extension, self.settings)
             self.destination_label.setText(f"{lang.lang.get('Output:')} {preview}")
 
     # ---------- Conversion ----------
@@ -1346,7 +793,20 @@ class MainWindow(QMainWindow):
             if scale:
                 extra_args.extend(["-vf", f"scale={scale}"])
 
-            task_list.append((converter, input_file, self._build_output_path(input_file, converter.output_extension, opts)))
+            output_path = build_output_path(input_file, converter.output_extension, self.settings)
+            configured_converter = self._configured_converter(converter, opts, extra_args)
+            task_list.append((configured_converter, input_file, output_path))
+            self._set_row_status(row, "🟡 Waiting")
+
+        if not task_list:
+            QMessageBox.warning(self, lang.lang.get("No converter"), lang.lang.get("No queued file has an available converter."))
+            return
+
+        self._output_files = [output_file for _, _, output_file in task_list]
+        self.progress_bar.setMaximum(len(task_list))
+        self.progress_bar.setValue(0)
+        self.conversion_progress_bar.setValue(0)
+        self.conversion_info_label.setText(f"0 / {len(task_list)} files | 0.00 MB/s")
 
         logger.info("Starting conversion:")
         for idx, (converter, input_file, output_file) in enumerate(task_list, start=1):
@@ -1366,6 +826,8 @@ class MainWindow(QMainWindow):
 
     def update_conversion_progress(self, value):
         self.progress_bar.setValue(value)
+        total = self.progress_bar.maximum()
+        self.conversion_info_label.setText(f"{value} / {total} files | {self.current_speed}")
 
     def update_per_file_progress(self, value):
         self.conversion_progress_bar.setValue(value)
@@ -1375,7 +837,9 @@ class MainWindow(QMainWindow):
 
     def update_speed(self, speed):
         self.current_speed = speed
-        self.speed_label.setText(f"Speed: {speed}")
+        total = self.progress_bar.maximum()
+        done = self.progress_bar.value()
+        self.conversion_info_label.setText(f"{done} / {total} files | {speed}")
 
     def update_current_file(self, file_name):
         self.current_file_label.setText(f"{lang.lang.get('File:')} {file_name}")
@@ -1390,6 +854,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.conversion_progress_bar.setValue(100)
         self.statusBar().showMessage(lang.lang.get("Conversion complete"))
+
+        self._mark_conversion_finished_rows(converted, errors)
+        self.completion_widget.show()
 
         if errors and len(errors) > 0:
             error_message = lang.lang.get("Conversion completed with errors:")
@@ -1409,8 +876,9 @@ class MainWindow(QMainWindow):
             if converter is None:
                 continue
 
-            output_file = self._build_output_path(input_file, converter.output_extension)
-            if row < len(self.converter_thread.errors):
+            file_name = Path(input_file).name
+            failed_names = {str(err).split(":", 1)[0].strip() for err in errors}
+            if file_name in failed_names:
                 self._set_row_status(row, "🔴 Failed ✕")
             else:
                 self._set_row_status(row, "✅ Done ✓")
@@ -1418,11 +886,11 @@ class MainWindow(QMainWindow):
     def _set_row_status(self, row, text):
         if row < 0 or row >= self.file_table.rowCount():
             return
-        item = self.file_table.item(row, 3)
+        item = self.file_table.item(row, 4)
         if item is None:
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
-            self.file_table.setItem(row, 3, item)
+            self.file_table.setItem(row, 4, item)
         else:
             item.setText(text)
             item.setTextAlignment(Qt.AlignCenter)
@@ -1445,3 +913,108 @@ class MainWindow(QMainWindow):
                 self._set_row_status(row, "🔴 Failed ✕")
             else:
                 self._set_row_status(row, "✅ Done ✓")
+    # ---------- Converter list and app actions ----------
+    def refresh_converter_list(self):
+        self.converter_list.clear()
+        converters = self.filter_converters_by_category(search_converters(self.search_bar.text(), self.available_converters))
+        for converter in converters:
+            item = QListWidgetItem(f"{converter.name} ({converter.output_extension.upper()})")
+            item.setData(Qt.UserRole, converter)
+            self.converter_list.addItem(item)
+
+    def selected_converter(self):
+        item = self.converter_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def update_converter_details(self, current, previous=None):
+        converter = current.data(Qt.UserRole) if current else None
+        if not converter:
+            self.converter_description_label.setText(lang.lang.get("Select a conversion to see the target format description"))
+            self.destination_label.setText(lang.lang.get("Destination path will appear after selecting a conversion"))
+            return
+        inputs = ", ".join(converter.input_extensions)
+        desc = EXTENSION_DESCRIPTIONS.get(converter.output_extension.lower(), "")
+        self.converter_description_label.setText(
+            f"{converter.name}\nInput: {inputs}\nOutput: {converter.output_extension.upper()}\n{desc}"
+        )
+        self._update_queue_preview()
+
+    def _configured_converter(self, converter, opts, extra_args):
+        if isinstance(converter, FFmpegConverter):
+            return FFmpegConverter(
+                converter.name, converter.input_extensions, converter.output_extension,
+                video_codec=opts.get("video_codec"), audio_codec=opts.get("audio_codec"),
+                extra_args=extra_args, threads=opts.get("threads", 0),
+                copy_mode=opts.get("copy_mode", False), copy_audio=opts.get("copy_audio", False),
+                start_time=opts.get("start_time"), end_time=opts.get("end_time"),
+                scale=opts.get("scale")
+            )
+        return converter
+
+    def show_file_context_menu(self, pos):
+        row = self.file_table.currentRow()
+        if row < 0:
+            return
+        menu = QMenu(self)
+        edit_action = menu.addAction(lang.lang.get("Edit Options"))
+        remove_action = menu.addAction(lang.lang.get("Remove"))
+        open_folder_action = menu.addAction(lang.lang.get("Reveal Output Folder"))
+        copy_path_action = menu.addAction(lang.lang.get("Copy Path"))
+        action = menu.exec_(self.file_table.viewport().mapToGlobal(pos))
+        if action == edit_action:
+            self._open_row_options(row)
+        elif action == remove_action:
+            item = self.file_table.item(row, 0)
+            if item:
+                self.queue_controller.discard(item.data(Qt.UserRole))
+            self.file_table.removeRow(row)
+        elif action == open_folder_action:
+            self._open_output_folder()
+        elif action == copy_path_action:
+            item = self.file_table.item(row, 0)
+            if item:
+                QApplication.clipboard().setText(item.data(Qt.UserRole))
+
+    def set_ui_enabled(self, enabled):
+        self.convert_action.setEnabled(enabled)
+        self.main_convert_btn.setEnabled(enabled)
+        # Keep queue browsing and adding files available while conversion runs.
+        self.open_action.setEnabled(True)
+        self.add_file_btn.setEnabled(True)
+        self.clear_all_btn.setEnabled(True)
+        self.converter_list.setEnabled(True)
+        self.file_table.setEnabled(True)
+        self.content_stack.setCurrentIndex(0 if enabled else 1)
+
+    def _open_output_folder(self):
+        path = Path(self._output_files[0]).parent if self._output_files else Path.cwd()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_output_file(self):
+        if self._output_files:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._output_files[0]))
+
+    def _go_back_to_main(self):
+        self.completion_widget.hide()
+        self.content_stack.setCurrentIndex(0)
+
+    def show_settings(self):
+        SettingsDialog(self).exec()
+
+    def show_about(self):
+        AboutDialog(self).exec()
+
+    def toggle_pause_conversion(self):
+        if not self.converter_thread:
+            return
+        if self._is_conversion_paused:
+            self.converter_thread.resume()
+            self.pause_button.setText(lang.lang.get("Pause"))
+        else:
+            self.converter_thread.pause()
+            self.pause_button.setText(lang.lang.get("Resume"))
+        self._is_conversion_paused = not self._is_conversion_paused
+
+    def cancel_conversion(self):
+        if self.converter_thread:
+            self.converter_thread.cancel()
