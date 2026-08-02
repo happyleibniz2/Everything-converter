@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import QApplication
 from ui.main_window import MainWindow
 from utils.paths import ROOT, RESOURCES
 from PyQt5.QtCore import QSettings
+from lang import lang
 
 def run():
     app = QApplication(sys.argv)
@@ -18,6 +19,12 @@ def run():
         cpu_count = multiprocessing.cpu_count()
         recommended = max(1, cpu_count // 2) if cpu_count <= 4 else cpu_count // 2
         settings.setValue("threads", recommended)
+
+    # Load language from settings
+    if not settings.contains("language"):
+        settings.setValue("language", "en_US")
+    lang_code = settings.value("language", "en_US", type=str)
+    lang.load_language(lang_code)
 
     # Load stylesheet (light)
     stylesheet = ROOT / "ui" / "styles.qss"

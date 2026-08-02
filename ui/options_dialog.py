@@ -58,16 +58,18 @@ PRESETS = {
 
 
 class ConversionOptionsDialog(QDialog):
-    def __init__(self, input_files, converter, parent=None):
+    def __init__(self, input_files, converter, parent=None, initial_options=None):
         super().__init__(parent)
         self.input_files = input_files
         self.converter = converter
         self.media_info = get_media_info(input_files[0]) if input_files else {}
+        self.initial_options = initial_options or {}
         self.setWindowTitle("Conversion Options")
         self.resize(720, 600)
         self.setModal(True)
         self._build_ui()
         self._populate_defaults()
+        self._apply_initial_options()
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
@@ -313,6 +315,67 @@ class ConversionOptionsDialog(QDialog):
             if "width" in self.media_info and hasattr(self, 'scale_width'):
                 self.scale_width.setValue(self.media_info["width"])
                 self.scale_height.setValue(self.media_info["height"])
+
+    def _apply_initial_options(self):
+        if not self.initial_options:
+            return
+
+        preset = self.initial_options.get("preset")
+        if preset and preset in PRESETS:
+            idx = self.preset_combo.findText(preset)
+            if idx >= 0:
+                self.preset_combo.setCurrentIndex(idx)
+
+        self.copy_mode_check.setChecked(self.initial_options.get("copy_mode", False))
+        self.copy_audio_check.setChecked(self.initial_options.get("copy_audio", False))
+        self.start_time_edit.setText(self.initial_options.get("start_time") or "")
+        self.end_time_edit.setText(self.initial_options.get("end_time") or "")
+        self.thread_spin.setValue(self.initial_options.get("threads", 0))
+        self.delete_source_check.setChecked(self.initial_options.get("delete_source", False))
+        self.shutdown_check.setChecked(self.initial_options.get("shutdown", False))
+
+        if self.converter.category == "Video":
+            codec = self.initial_options.get("video_codec")
+            if codec:
+                idx = self.video_codec_combo.findData(codec)
+                if idx >= 0:
+                    self.video_codec_combo.setCurrentIndex(idx)
+
+            if "crf" in self.initial_options:
+                self.quality_mode_combo.setCurrentIndex(0)
+                self.crf_slider.setValue(int(self.initial_options["crf"]))
+            elif "video_bitrate" in self.initial_options:
+                self.quality_mode_combo.setCurrentIndex(1)
+                self.bitrate_spin.setValue(int(self.initial_options["video_bitrate"]))
+
+            scale = self.initial_options.get("scale")
+            if scale:
+                try:
+                    w, h = map(int, scale.split(":", 1))
+                    self.scale_preset_combo.setCurrentIndex(4)
+                    self.scale_width.setValue(w)
+                    self.scale_height.setValue(h)
+                    self.scale_width.setEnabled(True)
+                    self.scale_height.setEnabled(True)
+                except Exception:
+                    pass
+
+        if self.converter.category in ("Video", "Audio"):
+            codec = self.initial_options.get("audio_codec")
+            if codec:
+                idx = self.audio_codec_combo.findData(codec)
+                if idx >= 0:
+                    self.audio_codec_combo.setCurrentIndex(idx)
+            self.audio_bitrate_spin.setValue(int(self.initial_options.get("audio_bitrate", self.audio_bitrate_spin.value())))
+            sample_rate = self.initial_options.get("sample_rate")
+            if sample_rate:
+                idx = self.sample_rate_combo.findText(str(sample_rate))
+                if idx >= 0:
+                    self.sample_rate_combo.setCurrentIndex(idx)
+
+        extra_args = self.initial_options.get("extra_args") or []
+        if extra_args:
+            self.extra_args_edit.setText(" ".join(extra_args))
 
     def _on_quality_mode_changed(self, index):
         is_crf = (index == 0)

@@ -19,7 +19,8 @@ BUILD_TYPE = "Debug"
 def package_version(name: str) -> str:
     try:
         return version(name)
-    except PackageNotFoundError:
+    except Exception:
+        # Any error resolving package metadata is treated as not installed
         return "Not Installed"
 
 
