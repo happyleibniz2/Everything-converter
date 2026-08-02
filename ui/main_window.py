@@ -1,246 +1,38 @@
 # ui/main_window.py
 
 import os
-import platform
 from pathlib import Path
 from PyQt5.QtCore import Qt, QSize, QSettings, QUrl
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QBrush, QDesktopServices
 from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QAction, QApplication, QComboBox, QDialog, QFileDialog,
+    QFrame, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar,
     QScrollArea, QStackedWidget, QStatusBar, QToolBar, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget, QGroupBox, QSpinBox,
-    QTabWidget, QListWidget, QListWidgetItem,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem,
     QMenu, QSystemTrayIcon, QSplitter, QHeaderView, QAbstractItemView
 )
 import lang
 from logger import logger
 from registry import CONVERTERS, find_converters, search_converters
 from converters.extensions import EXTENSION_DESCRIPTIONS
-from system_info import APP_VERSION, BUILD_TYPE, ffmpeg_version
 from utils.paths import ICONS, RESOURCES
 from converters.ffmpeg_base import FFmpegConverter
 from ui.options_dialog import ConversionOptionsDialog, PRESETS, DEFAULT_VIDEO_CODEC, DEFAULT_AUDIO_CODEC
+from ui.dialogs.settings_dialog import SettingsDialog
+from ui.dialogs.about_dialog import AboutDialog
 from ui.error_assistant import ErrorAssistant
 from ui.widgets.drop_area import DropArea
 from workers.conversion_worker import BatchConversionWorker
 from utils.media_info import get_media_info
 from services.size_estimator import estimate_output_size
 from controllers.queue_controller import QueueController
-
-# ---------- Batch Conversion Worker (unchanged) ----------
-class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.parent_window = parent
-        self.settings = QSettings("EverythingConverter", "Settings")
-        self.setWindowTitle(lang.lang.get("Settings"))
-        self.resize(500, 450)
-        self.init_ui()
-        self.load_settings()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
-
-        general_widget = QWidget()
-        general_layout = QFormLayout(general_widget)
-
-        self.dark_mode_checkbox = QCheckBox(lang.lang.get("Dark mode"))
-        self.follow_system_checkbox = QCheckBox(lang.lang.get("Follow system"))
-        general_layout.addRow(self.dark_mode_checkbox, self.follow_system_checkbox)
-
-        self.output_folder_combo = QComboBox()
-        self.output_folder_combo.addItems([lang.lang.get("Same folder"), lang.lang.get("Ask every time"), lang.lang.get("Custom folder")])
-        general_layout.addRow(lang.lang.get("Output Folder"), self.output_folder_combo)
-
-        self.custom_folder_edit = QLineEdit()
-        self.custom_folder_edit.setPlaceholderText(lang.lang.get("Path to custom output folder"))
-        browse_btn = QPushButton(lang.lang.get("Browse"))
-        browse_btn.clicked.connect(self.browse_custom_folder)
-        folder_layout = QHBoxLayout()
-        folder_layout.addWidget(self.custom_folder_edit)
-        folder_layout.addWidget(browse_btn)
-        general_layout.addRow(lang.lang.get("Custom Path"), folder_layout)
-
-        self.language_combo = QComboBox()
-        self.language_combo.addItem("English", "en_US")
-        self.language_combo.addItem("中文", "zh_CN")
-        self.language_combo.addItem("日本語", "ja_JP")
-        general_layout.addRow(lang.lang.get("Language"), self.language_combo)
-
-        self.overwrite_combo = QComboBox()
-        self.overwrite_combo.addItems([lang.lang.get("Rename"), lang.lang.get("Overwrite"), lang.lang.get("Skip"), lang.lang.get("Ask for name")])
-        general_layout.addRow(lang.lang.get("Overwrite behavior"), self.overwrite_combo)
-
-        self.logging_combo = QComboBox()
-        self.logging_combo.addItems([lang.lang.get("Verbose"), lang.lang.get("Normal"), lang.lang.get("Silent")])
-        general_layout.addRow(lang.lang.get("Logging"), self.logging_combo)
-
-        tabs.addTab(general_widget, lang.lang.get("General"))
-
-        adv_widget = QWidget()
-        adv_layout = QFormLayout(adv_widget)
-
-        self.thread_spin = QSpinBox()
-        self.thread_spin.setRange(0, 64)
-        self.thread_spin.setSpecialValueText("Auto")
-        self.thread_spin.setToolTip(lang.lang.get("0 = auto (no -threads), 1-64 = limit"))
-        adv_layout.addRow(lang.lang.get("Max threads"), self.thread_spin)
-
-        self.shutdown_check = QCheckBox(lang.lang.get("Shutdown after conversion"))
-        adv_layout.addRow(self.shutdown_check)
-
-        self.delete_source_check = QCheckBox(lang.lang.get("Delete source after conversion"))
-        adv_layout.addRow(self.delete_source_check)
-
-        self.temp_dir_edit = QLineEdit()
-        self.temp_dir_edit.setPlaceholderText(lang.lang.get("Temporary folder (leave empty for system temp)"))
-        adv_layout.addRow(lang.lang.get("Temp folder"), self.temp_dir_edit)
-
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(list(PRESETS.keys()))
-        adv_layout.addRow(lang.lang.get("Default Preset"), self.preset_combo)
-
-        tabs.addTab(adv_widget, lang.lang.get("Advanced"))
-
-        close_btn = QPushButton(lang.lang.get("Close"))
-        close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn, alignment=Qt.AlignRight)
-
-    def browse_custom_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, lang.lang.get("Select output folder"))
-        if folder:
-            self.custom_folder_edit.setText(folder)
-
-    def load_settings(self):
-        self.dark_mode_checkbox.setChecked(self.settings.value("dark_mode", False, type=bool))
-        self.follow_system_checkbox.setChecked(self.settings.value("follow_system", True, type=bool))
-        self.output_folder_combo.setCurrentIndex(self.settings.value("output_folder_mode", 0, type=int))
-        self.custom_folder_edit.setText(self.settings.value("custom_folder", "", type=str))
-        lang_code = self.settings.value("language", "en_US", type=str)
-        idx = self.language_combo.findData(lang_code)
-        if idx >= 0:
-            self.language_combo.setCurrentIndex(idx)
-        self.overwrite_combo.setCurrentIndex(self.settings.value("overwrite_behavior", 0, type=int))
-        self.logging_combo.setCurrentIndex(self.settings.value("logging", 1, type=int))
-        self.thread_spin.setValue(self.settings.value("threads", 0, type=int))
-        self.shutdown_check.setChecked(self.settings.value("shutdown_after", False, type=bool))
-        self.delete_source_check.setChecked(self.settings.value("delete_source", False, type=bool))
-        self.temp_dir_edit.setText(self.settings.value("temp_dir", "", type=str))
-        preset_idx = self.preset_combo.findText(self.settings.value("default_preset", "None", type=str))
-        if preset_idx >= 0:
-            self.preset_combo.setCurrentIndex(preset_idx)
-
-    def save_settings(self):
-        self.settings.setValue("dark_mode", self.dark_mode_checkbox.isChecked())
-        self.settings.setValue("follow_system", self.follow_system_checkbox.isChecked())
-        self.settings.setValue("output_folder_mode", self.output_folder_combo.currentIndex())
-        self.settings.setValue("custom_folder", self.custom_folder_edit.text())
-        lang_code = self.language_combo.currentData()
-        self.settings.setValue("language", lang_code)
-        self.settings.setValue("overwrite_behavior", self.overwrite_combo.currentIndex())
-        self.settings.setValue("logging", self.logging_combo.currentIndex())
-        self.settings.setValue("threads", self.thread_spin.value())
-        self.settings.setValue("shutdown_after", self.shutdown_check.isChecked())
-        self.settings.setValue("delete_source", self.delete_source_check.isChecked())
-        self.settings.setValue("temp_dir", self.temp_dir_edit.text())
-        self.settings.setValue("default_preset", self.preset_combo.currentText())
-
-    def accept(self):
-        self.save_settings()
-        # Reload language in global lang
-        lang_code = self.language_combo.currentData()
-        lang.lang.load_language(lang_code)
-        # Retranslate main window and this dialog
-        if self.parent_window:
-            self.parent_window.retranslate_ui()
-        self.retranslate_ui()
-        super().accept()
-
-    def retranslate_ui(self):
-        self.setWindowTitle(lang.lang.get("Settings"))
-        # Update combo box items
-        output_mode = self.output_folder_combo.currentIndex()
-        overwrite_mode = self.overwrite_combo.currentIndex()
-        logging_mode = self.logging_combo.currentIndex()
-        language_data = self.language_combo.currentData()
-        preset_text = self.preset_combo.currentText()
-
-        self.output_folder_combo.clear()
-        self.output_folder_combo.addItems([lang.lang.get("Same folder"), lang.lang.get("Ask every time"), lang.lang.get("Custom folder")])
-        self.output_folder_combo.setCurrentIndex(min(output_mode, self.output_folder_combo.count() - 1))
-
-        self.overwrite_combo.clear()
-        self.overwrite_combo.addItems([lang.lang.get("Rename"), lang.lang.get("Overwrite"), lang.lang.get("Skip"), lang.lang.get("Ask for name")])
-        self.overwrite_combo.setCurrentIndex(min(overwrite_mode, self.overwrite_combo.count() - 1))
-
-        self.logging_combo.clear()
-        self.logging_combo.addItems([lang.lang.get("Verbose"), lang.lang.get("Normal"), lang.lang.get("Silent")])
-        self.logging_combo.setCurrentIndex(min(logging_mode, self.logging_combo.count() - 1))
-
-        self.dark_mode_checkbox.setText(lang.lang.get("Dark mode"))
-        self.follow_system_checkbox.setText(lang.lang.get("Follow system"))
-        self.custom_folder_edit.setPlaceholderText(lang.lang.get("Path to custom output folder"))
-        # Find browse button
-        for child in self.findChildren(QPushButton):
-            if child.text() == "Browse" or child.text() == "浏览" or child.text() == "参照":
-                child.setText(lang.lang.get("Browse"))
-        # Tab titles
-        tabs = self.findChild(QTabWidget)
-        if tabs:
-            tabs.setTabText(0, lang.lang.get("General"))
-            tabs.setTabText(1, lang.lang.get("Advanced"))
-        # Advanced group
-        self.thread_spin.setToolTip(lang.lang.get("0 = auto (no -threads), 1-64 = limit"))
-        self.shutdown_check.setText(lang.lang.get("Shutdown after conversion"))
-        self.delete_source_check.setText(lang.lang.get("Delete source after conversion"))
-        self.temp_dir_edit.setPlaceholderText(lang.lang.get("Temporary folder (leave empty for system temp)"))
-        # close button
-        for btn in self.findChildren(QPushButton):
-            if btn.text() in ("Close", "关闭", "閉じる"):
-                btn.setText(lang.lang.get("Close"))
-
-        if language_data is not None:
-            idx = self.language_combo.findData(language_data)
-            if idx >= 0:
-                self.language_combo.setCurrentIndex(idx)
-        preset_idx = self.preset_combo.findText(preset_text)
-        if preset_idx >= 0:
-            self.preset_combo.setCurrentIndex(preset_idx)
-
-    # ---------- About Dialog (unchanged, can add translation later) ----------
-class AboutDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(lang.lang.get("About Everything Converter"))
-        self.resize(420, 320)
-
-        layout = QFormLayout(self)
-        title = QLabel(f"<b>{lang.lang.get('EverythingConverter')}</b>")
-        title.setTextFormat(Qt.RichText)
-        layout.addRow(title)
-        layout.addRow(lang.lang.get("Version"), QLabel(APP_VERSION))
-        layout.addRow(lang.lang.get("Build"), QLabel(BUILD_TYPE))
-        layout.addRow(lang.lang.get("Python"), QLabel(platform.python_version()))
-        from PyQt5.QtCore import QT_VERSION_STR
-        layout.addRow(lang.lang.get("Qt"), QLabel(QT_VERSION_STR))
-        layout.addRow(lang.lang.get("FFmpeg"), QLabel(ffmpeg_version()))
-        homepage = QLabel('<a href="https://example.com">https://example.com</a>')
-        homepage.setOpenExternalLinks(True)
-        layout.addRow(lang.lang.get("Homepage"), homepage)
-        layout.addRow(lang.lang.get("License"), QLabel("MIT"))
-
-        close_button = QPushButton(lang.lang.get("Close"))
-        close_button.clicked.connect(self.accept)
-        layout.addRow(close_button)
+from utils.formatter import format_short_duration, format_size
+from utils.output_builder import build_output_path
 
 
-# ---------- Main Window ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -855,7 +647,7 @@ class MainWindow(QMainWindow):
         if info.get("fps"):
             parts.append(f"{float(info['fps']):.0f} FPS")
         if info.get("duration"):
-            parts.append(self._format_short_duration(info["duration"]))
+            parts.append(format_short_duration(info["duration"]))
         if info.get("audio_codec"):
             parts.append(info["audio_codec"].upper())
         if info.get("sample_rate"):
@@ -873,7 +665,7 @@ class MainWindow(QMainWindow):
             elif ext in {".mp3", ".flac", ".wav", ".ogg", ".aac", ".m4a"}:
                 parts.append(Path(file_path).suffix.upper().lstrip("."))
             elif size:
-                parts.append(self._format_size(size))
+                parts.append(format_size(size))
             else:
                 parts.append("—")
 
@@ -890,8 +682,8 @@ class MainWindow(QMainWindow):
             default_preset=self.settings.value("default_preset", "None", type=str),
         )
         return (
-            f"≈{self._format_size(estimate['estimated'])} | "
-            f"Save {self._format_size(estimate['saved'])} "
+            f"≈{format_size(estimate['estimated'])} | "
+            f"Save {format_size(estimate['saved'])} "
             f"({estimate['percent']:.0f}%) {estimate['confidence']}"
         )
 
@@ -906,26 +698,6 @@ class MainWindow(QMainWindow):
             self._estimate_output_size_text(item.data(Qt.UserRole), combo.currentData(), self._row_options.get(row, {}))
         ))
         self._update_queue_preview()
-
-    def _format_short_duration(self, seconds):
-        seconds = float(seconds or 0)
-        if seconds <= 0:
-            return "—"
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        if seconds < 3600:
-            m, s = divmod(seconds, 60)
-            return f"{int(m):02d}:{int(s):02d}"
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
-
-    def _format_size(self, size):
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024.0 or unit == "TB":
-                return f"{size:.1f} {unit}"
-            size /= 1024.0
-        return f"{size:.1f} TB"
 
     def _open_row_options(self, row):
         file_path = self.file_table.item(row, 0).data(Qt.UserRole)
@@ -957,7 +729,7 @@ class MainWindow(QMainWindow):
             if converter is None:
                 self.destination_label.setText(lang.lang.get("Destination path will appear after selecting a conversion"))
                 return
-            preview = self._build_output_path(file_path, converter.output_extension)
+            preview = build_output_path(file_path, converter.output_extension, self.settings)
             self.destination_label.setText(f"{lang.lang.get('Output:')} {preview}")
 
     # ---------- Conversion ----------
@@ -1021,7 +793,7 @@ class MainWindow(QMainWindow):
             if scale:
                 extra_args.extend(["-vf", f"scale={scale}"])
 
-            output_path = self._build_output_path(input_file, converter.output_extension, opts)
+            output_path = build_output_path(input_file, converter.output_extension, self.settings)
             configured_converter = self._configured_converter(converter, opts, extra_args)
             task_list.append((configured_converter, input_file, output_path))
             self._set_row_status(row, "🟡 Waiting")
@@ -1166,21 +938,6 @@ class MainWindow(QMainWindow):
             f"{converter.name}\nInput: {inputs}\nOutput: {converter.output_extension.upper()}\n{desc}"
         )
         self._update_queue_preview()
-
-    def _build_output_path(self, input_file, output_extension, opts=None):
-        input_path = Path(input_file)
-        output_dir = input_path.parent
-        mode = self.settings.value("output_folder_mode", 0, type=int)
-        if mode == 2:
-            custom = self.settings.value("custom_folder", "", type=str)
-            if custom:
-                output_dir = Path(custom)
-        output_path = output_dir / f"{input_path.stem}{output_extension}"
-        counter = 1
-        while output_path.exists() and output_path.resolve() != input_path.resolve():
-            output_path = output_dir / f"{input_path.stem}_{counter}{output_extension}"
-            counter += 1
-        return str(output_path)
 
     def _configured_converter(self, converter, opts, extra_args):
         if isinstance(converter, FFmpegConverter):
