@@ -832,11 +832,12 @@ class MainWindow(QMainWindow):
         file_queue_layout.addWidget(self.add_file_btn)
         file_queue_layout.addWidget(self.clear_all_btn)
 
-        self.file_table = QTableWidget(0, 5)
+        self.file_table = QTableWidget(0, 6)
         self.file_table.setHorizontalHeaderLabels([
             lang.lang.get("Filename"),
             lang.lang.get("Target"),
             lang.lang.get("Metadata"),
+            lang.lang.get("Estimate"),
             lang.lang.get("Status"),
             lang.lang.get("Options")
         ])
@@ -844,8 +845,9 @@ class MainWindow(QMainWindow):
         self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.file_table.setColumnWidth(1, 190)
         self.file_table.setColumnWidth(2, 240)
-        self.file_table.setColumnWidth(3, 140)
-        self.file_table.setColumnWidth(4, 72)
+        self.file_table.setColumnWidth(3, 190)
+        self.file_table.setColumnWidth(4, 140)
+        self.file_table.setColumnWidth(5, 72)
         self.file_table.verticalHeader().setVisible(False)
         self.file_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1184,14 +1186,19 @@ class MainWindow(QMainWindow):
         metadata = self._format_queue_metadata(file_path)
         self.file_table.setItem(row, 2, QTableWidgetItem(metadata))
 
+        estimate_item = QTableWidgetItem(self._estimate_output_size_text(file_path, combo.currentData() if converters else None, {}))
+        self.file_table.setItem(row, 3, estimate_item)
+
         status_item = QTableWidgetItem("🟢 Ready")
         status_item.setTextAlignment(Qt.AlignCenter)
-        self.file_table.setItem(row, 3, status_item)
+        self.file_table.setItem(row, 4, status_item)
+
+        combo.currentIndexChanged.connect(lambda _idx, r=row: self._refresh_row_estimate(r))
 
         options_btn = QPushButton("⚙")
         options_btn.setFixedSize(32, 24)
         options_btn.clicked.connect(lambda _, r=row: self._open_row_options(r))
-        self.file_table.setCellWidget(row, 4, options_btn)
+        self.file_table.setCellWidget(row, 5, options_btn)
 
         self._row_options[row] = {}
         self._update_queue_preview()
@@ -1233,6 +1240,48 @@ class MainWindow(QMainWindow):
 
         return " | ".join(parts) if parts else "—"
 
+    def _estimate_output_size_text(self, file_path, converter, opts):
+        size = Path(file_path).stat().st_size if Path(file_path).exists() else 0
+        if not size:
+            return "—"
+        info = get_media_info(file_path) or {}
+        duration = float(info.get("duration") or 0)
+        video_bitrate = opts.get("video_bitrate")
+        audio_bitrate = opts.get("audio_bitrate") or info.get("audio_bitrate")
+        if duration and (video_bitrate or audio_bitrate):
+            total_kbps = int(video_bitrate or 0) + int(audio_bitrate or 0)
+            estimated = total_kbps * 1000 * duration / 8
+            confidence = "★★★★☆"
+        else:
+            preset = opts.get("preset", self.settings.value("default_preset", "None", type=str))
+            ratio_ranges = {
+                "Lossless (large)": (2.0, 5.0, "★★☆☆☆"),
+                "High Quality (local)": (0.9, 1.2, "★★★☆☆"),
+                "Fast (web friendly)": (0.7, 0.9, "★★★☆☆"),
+                "Small Size (mobile)": (0.2, 0.4, "★★★☆☆"),
+                "None": (0.7, 1.0, "★★☆☆☆"),
+            }
+            lo, hi, confidence = ratio_ranges.get(preset, ratio_ranges["None"])
+            target_ext = converter.output_extension.lower() if converter else ""
+            if target_ext in {".hevc", ".h265"} or opts.get("video_codec") == "libx265":
+                lo, hi = min(lo, 0.6), min(hi, 0.8)
+            estimated = size * ((lo + hi) / 2)
+        saved = max(0, size - estimated)
+        percent = (saved / size * 100) if size else 0
+        return f"≈{self._format_size(estimated)} | Save {self._format_size(saved)} ({percent:.0f}%) {confidence}"
+
+    def _refresh_row_estimate(self, row):
+        if row < 0 or row >= self.file_table.rowCount():
+            return
+        item = self.file_table.item(row, 0)
+        combo = self.file_table.cellWidget(row, 1)
+        if not item or not combo:
+            return
+        self.file_table.setItem(row, 3, QTableWidgetItem(
+            self._estimate_output_size_text(item.data(Qt.UserRole), combo.currentData(), self._row_options.get(row, {}))
+        ))
+        self._update_queue_preview()
+
     def _format_short_duration(self, seconds):
         seconds = float(seconds or 0)
         if seconds <= 0:
@@ -1266,6 +1315,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             opts = dlg.get_options()
             self._row_options[row] = opts
+            self._refresh_row_estimate(row)
             self._update_queue_preview()
 
     def _open_selected_row_options(self):
@@ -1346,7 +1396,20 @@ class MainWindow(QMainWindow):
             if scale:
                 extra_args.extend(["-vf", f"scale={scale}"])
 
-            task_list.append((converter, input_file, self._build_output_path(input_file, converter.output_extension, opts)))
+            output_path = self._build_output_path(input_file, converter.output_extension, opts)
+            configured_converter = self._configured_converter(converter, opts, extra_args)
+            task_list.append((configured_converter, input_file, output_path))
+            self._set_row_status(row, "🟡 Waiting")
+
+        if not task_list:
+            QMessageBox.warning(self, lang.lang.get("No converter"), lang.lang.get("No queued file has an available converter."))
+            return
+
+        self._output_files = [output_file for _, _, output_file in task_list]
+        self.progress_bar.setMaximum(len(task_list))
+        self.progress_bar.setValue(0)
+        self.conversion_progress_bar.setValue(0)
+        self.conversion_info_label.setText(f"0 / {len(task_list)} files | 0.00 MB/s")
 
         logger.info("Starting conversion:")
         for idx, (converter, input_file, output_file) in enumerate(task_list, start=1):
@@ -1366,6 +1429,8 @@ class MainWindow(QMainWindow):
 
     def update_conversion_progress(self, value):
         self.progress_bar.setValue(value)
+        total = self.progress_bar.maximum()
+        self.conversion_info_label.setText(f"{value} / {total} files | {self.current_speed}")
 
     def update_per_file_progress(self, value):
         self.conversion_progress_bar.setValue(value)
@@ -1375,7 +1440,9 @@ class MainWindow(QMainWindow):
 
     def update_speed(self, speed):
         self.current_speed = speed
-        self.speed_label.setText(f"Speed: {speed}")
+        total = self.progress_bar.maximum()
+        done = self.progress_bar.value()
+        self.conversion_info_label.setText(f"{done} / {total} files | {speed}")
 
     def update_current_file(self, file_name):
         self.current_file_label.setText(f"{lang.lang.get('File:')} {file_name}")
@@ -1390,6 +1457,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.conversion_progress_bar.setValue(100)
         self.statusBar().showMessage(lang.lang.get("Conversion complete"))
+
+        self._mark_conversion_finished_rows(converted, errors)
+        self.completion_widget.show()
 
         if errors and len(errors) > 0:
             error_message = lang.lang.get("Conversion completed with errors:")
@@ -1409,8 +1479,9 @@ class MainWindow(QMainWindow):
             if converter is None:
                 continue
 
-            output_file = self._build_output_path(input_file, converter.output_extension)
-            if row < len(self.converter_thread.errors):
+            file_name = Path(input_file).name
+            failed_names = {str(err).split(":", 1)[0].strip() for err in errors}
+            if file_name in failed_names:
                 self._set_row_status(row, "🔴 Failed ✕")
             else:
                 self._set_row_status(row, "✅ Done ✓")
@@ -1418,11 +1489,11 @@ class MainWindow(QMainWindow):
     def _set_row_status(self, row, text):
         if row < 0 or row >= self.file_table.rowCount():
             return
-        item = self.file_table.item(row, 3)
+        item = self.file_table.item(row, 4)
         if item is None:
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
-            self.file_table.setItem(row, 3, item)
+            self.file_table.setItem(row, 4, item)
         else:
             item.setText(text)
             item.setTextAlignment(Qt.AlignCenter)
@@ -1445,3 +1516,123 @@ class MainWindow(QMainWindow):
                 self._set_row_status(row, "🔴 Failed ✕")
             else:
                 self._set_row_status(row, "✅ Done ✓")
+    # ---------- Converter list and app actions ----------
+    def refresh_converter_list(self):
+        self.converter_list.clear()
+        converters = self.filter_converters_by_category(search_converters(self.search_bar.text(), self.available_converters))
+        for converter in converters:
+            item = QListWidgetItem(f"{converter.name} ({converter.output_extension.upper()})")
+            item.setData(Qt.UserRole, converter)
+            self.converter_list.addItem(item)
+
+    def selected_converter(self):
+        item = self.converter_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def update_converter_details(self, current, previous=None):
+        converter = current.data(Qt.UserRole) if current else None
+        if not converter:
+            self.converter_description_label.setText(lang.lang.get("Select a conversion to see the target format description"))
+            self.destination_label.setText(lang.lang.get("Destination path will appear after selecting a conversion"))
+            return
+        inputs = ", ".join(converter.input_extensions)
+        desc = EXTENSION_DESCRIPTIONS.get(converter.output_extension.lower(), "")
+        self.converter_description_label.setText(
+            f"{converter.name}\nInput: {inputs}\nOutput: {converter.output_extension.upper()}\n{desc}"
+        )
+        self._update_queue_preview()
+
+    def _build_output_path(self, input_file, output_extension, opts=None):
+        input_path = Path(input_file)
+        output_dir = input_path.parent
+        mode = self.settings.value("output_folder_mode", 0, type=int)
+        if mode == 2:
+            custom = self.settings.value("custom_folder", "", type=str)
+            if custom:
+                output_dir = Path(custom)
+        output_path = output_dir / f"{input_path.stem}{output_extension}"
+        counter = 1
+        while output_path.exists() and output_path.resolve() != input_path.resolve():
+            output_path = output_dir / f"{input_path.stem}_{counter}{output_extension}"
+            counter += 1
+        return str(output_path)
+
+    def _configured_converter(self, converter, opts, extra_args):
+        if isinstance(converter, FFmpegConverter):
+            return FFmpegConverter(
+                converter.name, converter.input_extensions, converter.output_extension,
+                video_codec=opts.get("video_codec"), audio_codec=opts.get("audio_codec"),
+                extra_args=extra_args, threads=opts.get("threads", 0),
+                copy_mode=opts.get("copy_mode", False), copy_audio=opts.get("copy_audio", False),
+                start_time=opts.get("start_time"), end_time=opts.get("end_time"),
+                scale=opts.get("scale")
+            )
+        return converter
+
+    def show_file_context_menu(self, pos):
+        row = self.file_table.currentRow()
+        if row < 0:
+            return
+        menu = QMenu(self)
+        edit_action = menu.addAction(lang.lang.get("Edit Options"))
+        remove_action = menu.addAction(lang.lang.get("Remove"))
+        open_folder_action = menu.addAction(lang.lang.get("Reveal Output Folder"))
+        copy_path_action = menu.addAction(lang.lang.get("Copy Path"))
+        action = menu.exec_(self.file_table.viewport().mapToGlobal(pos))
+        if action == edit_action:
+            self._open_row_options(row)
+        elif action == remove_action:
+            item = self.file_table.item(row, 0)
+            if item:
+                self._queued_file_keys.discard(os.path.abspath(item.data(Qt.UserRole)))
+            self.file_table.removeRow(row)
+        elif action == open_folder_action:
+            self._open_output_folder()
+        elif action == copy_path_action:
+            item = self.file_table.item(row, 0)
+            if item:
+                QApplication.clipboard().setText(item.data(Qt.UserRole))
+
+    def set_ui_enabled(self, enabled):
+        self.convert_action.setEnabled(enabled)
+        self.main_convert_btn.setEnabled(enabled)
+        # Keep queue browsing and adding files available while conversion runs.
+        self.open_action.setEnabled(True)
+        self.add_file_btn.setEnabled(True)
+        self.clear_all_btn.setEnabled(True)
+        self.converter_list.setEnabled(True)
+        self.file_table.setEnabled(True)
+        self.content_stack.setCurrentIndex(0 if enabled else 1)
+
+    def _open_output_folder(self):
+        path = Path(self._output_files[0]).parent if self._output_files else Path.cwd()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_output_file(self):
+        if self._output_files:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._output_files[0]))
+
+    def _go_back_to_main(self):
+        self.completion_widget.hide()
+        self.content_stack.setCurrentIndex(0)
+
+    def show_settings(self):
+        SettingsDialog(self).exec()
+
+    def show_about(self):
+        AboutDialog(self).exec()
+
+    def toggle_pause_conversion(self):
+        if not self.converter_thread:
+            return
+        if self._is_conversion_paused:
+            self.converter_thread.resume()
+            self.pause_button.setText(lang.lang.get("Pause"))
+        else:
+            self.converter_thread.pause()
+            self.pause_button.setText(lang.lang.get("Resume"))
+        self._is_conversion_paused = not self._is_conversion_paused
+
+    def cancel_conversion(self):
+        if self.converter_thread:
+            self.converter_thread.cancel()
