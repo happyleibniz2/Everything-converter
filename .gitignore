@@ -180,3 +180,4 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .vscode/settings.json
+nuitka-crash-report.xml
