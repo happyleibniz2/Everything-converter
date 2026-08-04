@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import psutil
-from PyQt5.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 import lang
 from logger import logger
@@ -13,13 +13,13 @@ from utils.paths import TEMP
 
 
 class BatchConversionWorker(QThread):
-    progress_updated = pyqtSignal(int)
-    per_file_progress = pyqtSignal(int)
-    status_message = pyqtSignal(str)
-    speed_updated = pyqtSignal(str)
-    current_file_updated = pyqtSignal(str)
-    time_updated = pyqtSignal(str, str)
-    conversion_finished = pyqtSignal(int, list)
+    progress_updated = Signal(int)
+    per_file_progress = Signal(int)
+    status_message = Signal(str)
+    speed_updated = Signal(str)
+    current_file_updated = Signal(str)
+    time_updated = Signal(str, str)
+    conversion_finished = Signal(int, list)
 
     def __init__(self, task_list, delete_source=False):
         super().__init__()
@@ -87,13 +87,13 @@ class BatchConversionWorker(QThread):
 
 
 class ConversionWorker(QThread):
-    progress_updated = pyqtSignal(int)
-    per_file_progress = pyqtSignal(int)
-    status_message = pyqtSignal(str)
-    speed_updated = pyqtSignal(str)
-    current_file_updated = pyqtSignal(str)
-    time_updated = pyqtSignal(str, str)
-    conversion_finished = pyqtSignal(int, list)
+    progress_updated = Signal(int)
+    per_file_progress = Signal(int)
+    status_message = Signal(str)
+    speed_updated = Signal(str)
+    current_file_updated = Signal(str)
+    time_updated = Signal(str, str)
+    conversion_finished = Signal(int, list)
 
     def __init__(self, converter, file_pairs, delete_source=False):
         super().__init__()
@@ -268,6 +268,3 @@ class ConversionWorker(QThread):
             self.per_file_progress.emit(100)
 
         self.conversion_finished.emit(self.converted, self.errors)
-
-
-# ---------- Drop Area (unchanged) ----------

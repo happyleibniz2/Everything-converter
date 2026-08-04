@@ -7,8 +7,8 @@ from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from PyQt5.QtCore import QLibraryInfo, Qt
-from PyQt5.QtGui import QGuiApplication
+from PySide6.QtCore import QLibraryInfo, Qt
+from PySide6.QtGui import QGuiApplication
 from utils.paths import FFMPEG, OUTPUT, TEMP, LOGS
 
 APP_NAME = "Everything Converter"
@@ -81,7 +81,7 @@ def generate_report() -> str:
     lines.append("QT")
     lines.append("-" * 60)
     lines.append(f"Qt Version        : {QLibraryInfo.version().toString()}")
-    lines.append(f"PyQt5 Version     : {package_version('PyQt5')}")
+    lines.append(f"PySide6 Version     : {package_version('PySide6')}")
     lines.append(f"Theme             : {_get_theme()}")
     lines.append(f"Language          : {locale.getdefaultlocale()[0]}")
     lines.append("")

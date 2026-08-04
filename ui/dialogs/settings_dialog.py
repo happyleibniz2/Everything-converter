@@ -1,7 +1,8 @@
-from PyQt5.QtCore import QSettings
-from PyQt5.QtWidgets import (
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QLineEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget
+    QLineEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QHBoxLayout
 )
 
 import lang
@@ -165,7 +166,7 @@ class SettingsDialog(QDialog):
         self.custom_folder_edit.setPlaceholderText(lang.lang.get("Path to custom output folder"))
         # Find browse button
         for child in self.findChildren(QPushButton):
-            if child.text() == "Browse" or child.text() == "浏览" or child.text() == "参照":
+            if child.text() in ("Browse", "浏览", "参照"):
                 child.setText(lang.lang.get("Browse"))
         # Tab titles
         tabs = self.findChild(QTabWidget)
@@ -189,5 +190,3 @@ class SettingsDialog(QDialog):
         preset_idx = self.preset_combo.findText(preset_text)
         if preset_idx >= 0:
             self.preset_combo.setCurrentIndex(preset_idx)
-
-    # ---------- About Dialog (unchanged, can add translation later) ----------

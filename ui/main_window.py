@@ -2,11 +2,11 @@
 
 import os
 from pathlib import Path
-from PyQt5.QtCore import Qt, QSize, QSettings, QUrl
-from PyQt5.QtGui import QIcon, QPixmap, QPainter, QBrush, QDesktopServices
-from PyQt5.QtSvg import QSvgRenderer
-from PyQt5.QtWidgets import (
-    QAction, QApplication, QComboBox, QDialog, QFileDialog,
+from PySide6.QtCore import Qt, QSize, QSettings, QUrl
+from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QBrush, QDesktopServices
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QFileDialog,
     QFrame, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar,
     QScrollArea, QStackedWidget, QStatusBar, QToolBar, QTreeWidget,
@@ -57,6 +57,19 @@ class MainWindow(QMainWindow):
         self.tray_icon = None
         self.setup_tray()
 
+        # Window sizing and persistence
+        geometry = self.settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        else:
+            self.resize(1000, 700)
+
+        self.setMinimumSize(800, 500)
+
+    def closeEvent(self, event):
+        self.settings.setValue("window_geometry", self.saveGeometry())
+        super().closeEvent(event)
+
     def retranslate_ui(self):
         self.setWindowTitle(lang.lang.get("EverythingConverter"))
         # Actions
@@ -65,7 +78,7 @@ class MainWindow(QMainWindow):
         self.convert_action.setText(lang.lang.get("Convert"))
         self.settings_action.setText(lang.lang.get("Settings"))
         self.about_action.setText(lang.lang.get("About Everything Converter"))
-        # Menu bar - since we don't store references, we set directly
+        # Menu bar
         file_menu = self.menuBar().actions()[0]
         tools_menu = self.menuBar().actions()[1]
         help_menu = self.menuBar().actions()[2]
@@ -96,7 +109,7 @@ class MainWindow(QMainWindow):
         self.current_converter_label.setText(f"{lang.lang.get('Current Converter:')} -")
         self.current_file_label.setText(f"{lang.lang.get('File:')} -")
         self.conversion_info_label.setText("0 / 0 files | 0.00 MB/s")
-        # Timing labels (children of timing_container)
+        # Timing labels
         for child in self.timing_container.findChildren(QLabel):
             if child.text() in ("Elapsed:", "已用时间:", "経過時間:"):
                 child.setText(lang.lang.get("Elapsed:"))
@@ -109,17 +122,15 @@ class MainWindow(QMainWindow):
         self.open_folder_btn.setText(lang.lang.get("Open Folder"))
         self.open_file_btn.setText(lang.lang.get("Open File"))
         self.back_btn.setText(lang.lang.get("Back"))
-        # Sidebar items (they are set dynamically, but the first item is Favorites)
+        # Sidebar items
         if self.sidebar.topLevelItemCount() > 0:
             fav_item = self.sidebar.topLevelItem(0)
             if fav_item:
                 fav_item.setText(0, f"{lang.lang.get('Favorites')} (0)")
-        # File formats header
         if self.sidebar.topLevelItemCount() > 1:
             formats_item = self.sidebar.topLevelItem(1)
             if formats_item:
                 formats_item.setText(0, lang.lang.get("File Formats"))
-        # Refresh sidebar counts
         self.update_sidebar_counts()
 
     def load_general_settings(self):
@@ -169,7 +180,7 @@ class MainWindow(QMainWindow):
         else:
             stylesheet_path = Path(__file__).parent / "styles.qss"
             if stylesheet_path.exists():
-                self.setStyleSheet(stylesheet_path.read_text())
+                self.setStyleSheet(stylesheet_path.read_text(encoding='utf-8'))
 
     def _create_actions(self):
         self.exit_action = QAction(lang.lang.get("Exit"), self)
@@ -251,6 +262,9 @@ class MainWindow(QMainWindow):
         self.search_bar.setPlaceholderText(lang.lang.get("Search conversions..."))
         self.search_bar.textChanged.connect(self.on_search_text_changed)
 
+        self.detected_extension_label = QLabel(lang.lang.get("Drop a file to detect available conversions"))
+        self.detected_extension_label.setObjectName("detectedExtensionLabel")
+
         # File queue header with buttons
         file_queue_widget = QWidget()
         file_queue_layout = QHBoxLayout(file_queue_widget)
@@ -265,6 +279,12 @@ class MainWindow(QMainWindow):
         file_queue_layout.addWidget(self.add_file_btn)
         file_queue_layout.addWidget(self.clear_all_btn)
 
+        # Drop area and file table in a vertical splitter (inner splitter)
+        self.drop_area = DropArea()
+        self.drop_area.setMinimumHeight(0)          # override stylesheet min-height
+        self.drop_area.files_dropped.connect(self.handle_files)
+        self.drop_area.browse_requested.connect(self.browse_files)
+
         self.file_table = QTableWidget(0, 6)
         self.file_table.setHorizontalHeaderLabels([
             lang.lang.get("Filename"),
@@ -274,34 +294,71 @@ class MainWindow(QMainWindow):
             lang.lang.get("Status"),
             lang.lang.get("Options")
         ])
+
+        # Column sizing
+        self.file_table.setColumnWidth(0, 200)   # Filename
+        self.file_table.setColumnWidth(1, 120)   # Target
+        self.file_table.setColumnWidth(2, 200)   # Metadata
+        self.file_table.setColumnWidth(3, 120)   # Estimate
+        self.file_table.setColumnWidth(4, 80)    # Status
+        self.file_table.setColumnWidth(5, 50)    # Options
+
+        # Make Filename and Metadata stretch
         self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.file_table.setColumnWidth(1, 190)
-        self.file_table.setColumnWidth(2, 240)
-        self.file_table.setColumnWidth(3, 190)
-        self.file_table.setColumnWidth(4, 140)
-        self.file_table.setColumnWidth(5, 72)
+        for col in (1, 3, 4, 5):
+            self.file_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.Interactive)
+
+        # Add tooltips to column headers
+        header_item = self.file_table.horizontalHeaderItem(0)
+        if header_item:
+            header_item.setToolTip("Full filename (including extension)")
+        header_item = self.file_table.horizontalHeaderItem(1)
+        if header_item:
+            header_item.setToolTip("Target output format")
+        header_item = self.file_table.horizontalHeaderItem(2)
+        if header_item:
+            header_item.setToolTip("Media metadata: resolution, codec, duration, etc.")
+        header_item = self.file_table.horizontalHeaderItem(3)
+        if header_item:
+            header_item.setToolTip("Estimated output file size and space saved")
+        header_item = self.file_table.horizontalHeaderItem(4)
+        if header_item:
+            header_item.setToolTip("Conversion status: Ready, Processing, Done, Failed")
+        header_item = self.file_table.horizontalHeaderItem(5)
+        if header_item:
+            header_item.setToolTip("Click to open conversion options for this file")
+
+        self.file_table.horizontalHeader().setStretchLastSection(False)
         self.file_table.verticalHeader().setVisible(False)
         self.file_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.file_table.setDragEnabled(False)
-        self.file_table.setMinimumHeight(150)
+        self.file_table.setMinimumHeight(100)
         self.file_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_table.doubleClicked.connect(self._open_selected_row_options)
         self.file_table.customContextMenuRequested.connect(self.show_file_context_menu)
 
+        # Inner splitter: drop area vs file table
+        inner_splitter = QSplitter(Qt.Vertical)
+        inner_splitter.addWidget(self.drop_area)
+        inner_splitter.addWidget(self.file_table)
+        inner_splitter.setStretchFactor(0, 0)   # drop area does not stretch
+        inner_splitter.setStretchFactor(1, 1)   # table gets extra space
+        inner_splitter.setSizes([60, 400])
+
+        # Convert button (stays above converter list)
         self.main_convert_btn = QPushButton(lang.lang.get("Convert"))
         self.main_convert_btn.setObjectName("mainConvertButton")
         self.main_convert_btn.setMinimumHeight(42)
         self.main_convert_btn.setStyleSheet("QPushButton#mainConvertButton { background: #2e7d32; color: white; font-weight: bold; }")
         self.main_convert_btn.clicked.connect(self.convert_selected_files)
 
-        self.drop_area = DropArea()
-        self.drop_area.files_dropped.connect(self.handle_files)
-        self.drop_area.browse_requested.connect(self.browse_files)
-
-        self.detected_extension_label = QLabel(lang.lang.get("Drop a file to detect available conversions"))
-        self.detected_extension_label.setObjectName("detectedExtensionLabel")
+        # Bottom part: converter list, description, destination
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(8)
 
         self.converter_list_label = QLabel(lang.lang.get("Converter List (global fallback if no per-file selection)"))
         self.converter_list = QListWidget()
@@ -326,16 +383,31 @@ class MainWindow(QMainWindow):
         self.destination_label.setObjectName("destinationLabel")
         self.destination_label.setWordWrap(True)
 
-        content_layout.addWidget(self.search_bar)
-        content_layout.addWidget(self.detected_extension_label)
-        content_layout.addWidget(self.drop_area)
-        content_layout.addWidget(file_queue_widget)
-        content_layout.addWidget(self.file_table)
-        content_layout.addWidget(self.main_convert_btn, alignment=Qt.AlignRight)
-        content_layout.addWidget(self.converter_list_label)
-        content_layout.addWidget(self.converter_list)
-        content_layout.addWidget(self.description_scroll_area)
-        content_layout.addWidget(self.destination_label)
+        bottom_layout.addWidget(self.converter_list_label)
+        bottom_layout.addWidget(self.converter_list)
+        bottom_layout.addWidget(self.description_scroll_area)
+        bottom_layout.addWidget(self.destination_label)
+
+        # Create a top widget that contains everything above the bottom_widget
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(12)
+        top_layout.addWidget(self.search_bar)
+        top_layout.addWidget(self.detected_extension_label)
+        top_layout.addWidget(file_queue_widget)
+        top_layout.addWidget(inner_splitter)      # drop + table
+        top_layout.addWidget(self.main_convert_btn, alignment=Qt.AlignRight)
+
+        # Main vertical splitter: top_widget vs bottom_widget
+        main_splitter = QSplitter(Qt.Vertical)
+        main_splitter.addWidget(top_widget)
+        main_splitter.addWidget(bottom_widget)
+        main_splitter.setStretchFactor(0, 2)      # top area gets more space
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([600, 300])        # initial distribution
+
+        content_layout.addWidget(main_splitter)
 
         # Stacked widget
         self.content_stack = QStackedWidget()
@@ -439,7 +511,7 @@ class MainWindow(QMainWindow):
 
         self.content_stack.addWidget(conversion_view)
 
-        # Splitter
+        # Main horizontal splitter (sidebar vs content)
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.sidebar)
         splitter.addWidget(self.content_stack)
@@ -913,6 +985,7 @@ class MainWindow(QMainWindow):
                 self._set_row_status(row, "🔴 Failed ✕")
             else:
                 self._set_row_status(row, "✅ Done ✓")
+
     # ---------- Converter list and app actions ----------
     def refresh_converter_list(self):
         self.converter_list.clear()

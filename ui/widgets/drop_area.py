@@ -1,15 +1,15 @@
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QIcon, QPixmap, QPainter
-from PyQt5.QtSvg import QSvgRenderer
-from PyQt5.QtWidgets import QFrame, QLabel, QVBoxLayout
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QIcon, QPixmap, QPainter
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout
 
 import lang
 from utils.paths import ICONS
 
 
 class DropArea(QFrame):
-    files_dropped = pyqtSignal(list)
-    browse_requested = pyqtSignal()
+    files_dropped = Signal(list)
+    browse_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -100,8 +100,5 @@ class DropArea(QFrame):
         self.browse_label.setText(lang.lang.get("Click to browse"))
         # "or" label is not stored as attribute, find it
         for child in self.children():
-            if isinstance(child, QLabel) and child.objectName() != "dropTitle" and child.objectName() != "browseLabel" and child.objectName() != "dropIcon":
+            if isinstance(child, QLabel) and child.objectName() not in ("dropTitle", "browseLabel", "dropIcon"):
                 child.setText(lang.lang.get("or"))
-
-
-# ---------- Settings Dialog ----------

@@ -1,5 +1,5 @@
 from pathlib import Path
-from PyQt5.QtCore import QSettings
+from PySide6.QtCore import QSettings
 
 
 def build_output_path(input_file: str, output_extension: str, settings: QSettings) -> str:

@@ -1,7 +1,7 @@
 import platform
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QDialog, QFormLayout, QLabel, QPushButton
+from PySide6.QtCore import Qt, qVersion
+from PySide6.QtWidgets import QDialog, QFormLayout, QLabel, QPushButton
 
 import lang
 from system_info import APP_VERSION, BUILD_TYPE, ffmpeg_version
@@ -20,8 +20,7 @@ class AboutDialog(QDialog):
         layout.addRow(lang.lang.get("Version"), QLabel(APP_VERSION))
         layout.addRow(lang.lang.get("Build"), QLabel(BUILD_TYPE))
         layout.addRow(lang.lang.get("Python"), QLabel(platform.python_version()))
-        from PyQt5.QtCore import QT_VERSION_STR
-        layout.addRow(lang.lang.get("Qt"), QLabel(QT_VERSION_STR))
+        layout.addRow(lang.lang.get("Qt"), QLabel(qVersion()))
         layout.addRow(lang.lang.get("FFmpeg"), QLabel(ffmpeg_version()))
         homepage = QLabel('<a href="https://example.com">https://example.com</a>')
         homepage.setOpenExternalLinks(True)
@@ -31,6 +30,3 @@ class AboutDialog(QDialog):
         close_button = QPushButton(lang.lang.get("Close"))
         close_button.clicked.connect(self.accept)
         layout.addRow(close_button)
-
-
-# ---------- Main Window ----------

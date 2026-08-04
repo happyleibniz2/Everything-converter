@@ -1,12 +1,12 @@
 # ui/error_assistant.py
 
 import re
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import (
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QTextEdit, QSplitter, QMessageBox, QApplication
 )
-from PyQt5.QtGui import QFont
+from PySide6.QtGui import QFont
 from lang import lang
 
 
@@ -135,7 +135,7 @@ def extract_file_name(error_line: str) -> str:
 
 
 class ErrorAssistant(QDialog):
-    retry_requested = pyqtSignal(list)
+    retry_requested = Signal(list)
 
     def __init__(self, errors, parent=None):
         super().__init__(parent)
