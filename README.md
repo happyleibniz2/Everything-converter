@@ -1,5 +1,5 @@
 
-# Everything Converter — The All-in-One Multimedia Converter
+# Everything Converter — The All‑in‑One Multimedia Converter
 
 **Stop juggling multiple tools.** Everything Converter is a powerful, free, and open‑source desktop application that handles all your image, video, and audio conversion needs in one clean interface. Drag, drop, convert — it’s that simple.
 
@@ -39,11 +39,13 @@
 
 Everything Converter is **free and open‑source** (MIT license). The core conversion engine, drag‑and‑drop interface, batch processing, and all existing features will remain free forever.
 
-**In the future, we may introduce premium add‑ons** to support ongoing development, such as:
-- Cloud‑based batch processing (offload heavy conversions)
-- Advanced automation (watch folders, scheduled conversions)
-- Priority support and enterprise features
-- Exclusive presets and filters
+For users who need extra performance and support, we offer a **Premium tier** that helps fund ongoing development:
+
+| Premium Feature | Description |
+|-----------------|-------------|
+| 🚀 **GPU Acceleration** | NVENC, AMD AMF, Intel QSV support – convert videos 3‑10x faster by leveraging your graphics card. |
+| 🔁 **Unlimited Batch** | No limit on simultaneous conversions. Convert as many files in parallel as your hardware can handle. |
+| 📧 **Priority Support** | Faster responses via email – get help when you need it most. |
 
 These premium options will never lock basic functionality – you’ll always be able to convert your files without paying a cent.
 
