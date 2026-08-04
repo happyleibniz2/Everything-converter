@@ -1,7 +1,7 @@
 
 # Everything Converter — The All-in-One Multimedia Converter
 
-**Stop juggling multiple tools.** Everything Converter is a powerful, free, and open-source desktop application that handles all your image, video, and audio conversion needs in one clean interface. Drag, drop, convert—it's that simple.
+**Stop juggling multiple tools.** Everything Converter is a powerful, free, and open‑source desktop application that handles all your image, video, and audio conversion needs in one clean interface. Drag, drop, convert — it’s that simple.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen)
@@ -15,7 +15,7 @@
 - **One Tool for Everything** – From PNG to JPG, MP4 to MKV, MP3 to FLAC, and more. No need for separate apps.
 - **Batch Processing** – Convert hundreds of files at once, each with its own target format.
 - **Drag & Drop Simplicity** – Just drop your files and go. No complicated settings unless you want them.
-- **Advanced Options When You Need Them** – Fine-tune video codecs, quality, scaling, trimming, and audio settings per file.
+- **Advanced Options When You Need Them** – Fine‑tune video codecs, quality, scaling, trimming, and audio settings per file.
 - **Real‑time Progress** – See speed, time remaining, and per‑file progress as your conversions run.
 - **Pause & Resume** – Control conversions at your own pace.
 - **Error Assistant** – Get helpful suggestions when something goes wrong.
@@ -32,6 +32,20 @@
 | 🖼️ **Images** | PNG, JPG/JPEG, GIF, WebP, TIFF, BMP, HEIF/HEIC, EPS |
 | 🎬 **Video** | MP4, MKV, MOV, AVI, WebM, FLV, 3GP, WMV (with H.264/HEVC/VP8/VP9 support) |
 | 🎵 **Audio** | MP3, AAC, FLAC, WAV, OGG (Vorbis), M4A, WMA – plus extraction from video |
+
+---
+
+## Free Forever – With Optional Premium Add‑ons
+
+Everything Converter is **free and open‑source** (MIT license). The core conversion engine, drag‑and‑drop interface, batch processing, and all existing features will remain free forever.
+
+**In the future, we may introduce premium add‑ons** to support ongoing development, such as:
+- Cloud‑based batch processing (offload heavy conversions)
+- Advanced automation (watch folders, scheduled conversions)
+- Priority support and enterprise features
+- Exclusive presets and filters
+
+These premium options will never lock basic functionality – you’ll always be able to convert your files without paying a cent.
 
 ---
 
@@ -87,7 +101,7 @@ It's that simple.
 
 ---
 
-## In-Depth Features
+## In‑Depth Features
 
 ### Per‑File Customization
 Not all files are the same. You can set different conversion parameters for each file:
@@ -185,7 +199,7 @@ Please follow our coding style (Black + Flake8).
 
 ## Support the Project
 
-If Everything Converter saves you time and makes your life easier, consider supporting its ongoing development. Every contribution helps keep the project alive and improving!
+If Everything Converter saves you time and makes your life easier, consider supporting its ongoing development. Your support helps us keep the core free and fund future premium features.
 
 | Platform | Link |
 |----------|------|
@@ -206,7 +220,7 @@ MIT License – see the [LICENSE](LICENSE) file for details.
 
 - [FFmpeg](https://ffmpeg.org/) – the backbone of video/audio conversion
 - [Pillow](https://python-pillow.org/) – image processing made easy
-- [PySide6](https://doc.qt.io/qtforpython-6/) – beautiful cross-platform GUIs
+- [PySide6](https://doc.qt.io/qtforpython-6/) – beautiful cross‑platform GUIs
 - [Xiph.Org](https://www.xiph.org/) – for open codecs like Vorbis, Opus, and FLAC
 
 ---
