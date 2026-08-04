@@ -1,338 +1,200 @@
-from pathlib import Path
-import platform
-import time
-from PySide6.QtCore import Qt, Signal, QThread, QSize
-from PySide6 import __version__ as QT_VERSION_STR
-from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QBrush
-from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
-    QDialog,
-    QFileDialog,
-    QFormLayout,
-    QFrame,
-    QHBoxLayout,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QProgressBar,
-    QScrollArea,
-    QStackedWidget,
-    QStatusBar,
-    QToolBar,
-    QTreeWidget,
-    QTreeWidgetItem,
-    QVBoxLayout,
-    QWidget,
-    QApplication,
-)
+# ui/main_window.py
 
+import os
+from pathlib import Path
+from PyQt5.QtCore import Qt, QSize, QSettings, QUrl
+from PyQt5.QtGui import QIcon, QPixmap, QPainter, QBrush, QDesktopServices
+from PyQt5.QtSvg import QSvgRenderer
+from PyQt5.QtWidgets import (
+    QAction, QApplication, QComboBox, QDialog, QFileDialog,
+    QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QTableWidget, QTableWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar,
+    QScrollArea, QStackedWidget, QStatusBar, QToolBar, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem,
+    QMenu, QSystemTrayIcon, QSplitter, QHeaderView, QAbstractItemView
+)
+import lang
 from logger import logger
 from registry import CONVERTERS, find_converters, search_converters
 from converters.extensions import EXTENSION_DESCRIPTIONS
-from system_info import APP_VERSION, BUILD_TYPE, ffmpeg_version
 from utils.paths import ICONS, RESOURCES
-
-
-class ConversionWorker(QThread):
-    """Worker thread for file conversions."""
-
-    progress_updated = Signal(int)
-    per_file_progress = Signal(int)
-    status_message = Signal(str)
-    speed_updated = Signal(str)
-    current_file_updated = Signal(str)
-    time_updated = Signal(str, str)
-    conversion_finished = Signal(int, list)
-
-    def __init__(self, converter, file_pairs):
-        super().__init__()
-        self.converter = converter
-        self.file_pairs = file_pairs
-        self.converted = 0
-        self.errors = []
-        self.is_paused = False
-        self.is_cancelled = False
-        self.start_time = None
-        self.bytes_processed = 0
-
-    def pause(self):
-        self.is_paused = True
-
-    def resume(self):
-        self.is_paused = False
-
-    def cancel(self):
-        self.is_cancelled = True
-
-    def run(self):
-        total_files = len(self.file_pairs)
-        self.start_time = time.time()
-
-        total_files = len(self.file_pairs)
-        for index, (file_name, output_file) in enumerate(self.file_pairs, start=1):
-            if self.is_cancelled:
-                break
-
-            while self.is_paused:
-                time.sleep(0.1)
-
-            self.current_file_updated.emit(Path(file_name).name)
-            self.status_message.emit(f"Converting {index}/{total_files}...")
-
-            try:
-                file_size = Path(file_name).stat().st_size
-                logger.info("================================================")
-                logger.info("Conversion")
-                logger.info("Input: %s", file_name)
-                logger.info("Output: %s", output_file)
-                logger.info("Converter: %s", self.converter.name)
-                start_file = time.time()
-
-                if hasattr(self.converter, "convert_with_progress"):
-                    def _progress_cb(percent, elapsed_sec, remaining_sec):
-                        while self.is_paused:
-                            time.sleep(0.1)
-
-                        elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed_sec))
-                        remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining_sec)) if remaining_sec else "00:00:00"
-
-                        try:
-                            bytes_for_file = int(file_size * (percent / 100.0))
-                        except Exception:
-                            bytes_for_file = 0
-
-                        total_processed = self.bytes_processed + bytes_for_file
-                        total_elapsed = time.time() - self.start_time if self.start_time else elapsed_sec
-                        speed_mbps = (total_processed / (1024 * 1024)) / max(total_elapsed, 0.001)
-
-                        self.per_file_progress.emit(int(percent))
-                        self.time_updated.emit(elapsed_text, remaining_text)
-                        self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
-
-                    self.converter.convert_with_progress(file_name, output_file, progress_callback=_progress_cb, should_cancel=lambda: self.is_cancelled)
-                else:
-                    self.converter.convert(file_name, output_file)
-
-                duration = time.time() - start_file
-                self.bytes_processed += file_size
-                self.converted += 1
-
-                logger.info("Duration: %.2f seconds", duration)
-                logger.info("Success")
-            except Exception as exc:
-                logger.exception("Conversion failed for %s", file_name)
-                self.errors.append(f"{Path(file_name).name}: {exc}")
-                if self.is_cancelled:
-                    self.status_message.emit("Conversion canceled")
-                    break
-
-            elapsed = time.time() - self.start_time
-            remaining = 0.0
-            if index > 0 and index < total_files:
-                remaining = elapsed / index * (total_files - index)
-
-            elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining))
-
-            speed_mbps = (self.bytes_processed / (1024 * 1024)) / max(elapsed, 0.001)
-            self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
-            self.time_updated.emit(elapsed_text, remaining_text)
-            self.progress_updated.emit(index)
-            self.per_file_progress.emit(100)
-
-        self.conversion_finished.emit(self.converted, self.errors)
-
-
-class DropArea(QFrame):
-    files_dropped = Signal(list)
-    browse_requested = Signal()
-
-    def __init__(self):
-        super().__init__()
-        self.setAcceptDrops(True)
-        self.setObjectName("dropArea")
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setCursor(Qt.PointingHandCursor)
-
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(12)
-
-        self.icon_label = QLabel()
-        self.icon_label.setAlignment(Qt.AlignCenter)
-        self.icon_label.setObjectName("dropIcon")
-        self.set_icon(None)
-
-        title_label = QLabel("Drop files here")
-        title_label.setAlignment(Qt.AlignCenter)
-        title_label.setObjectName("dropTitle")
-
-        or_label = QLabel("or")
-        or_label.setAlignment(Qt.AlignCenter)
-
-        browse_label = QLabel("Click to browse")
-        browse_label.setAlignment(Qt.AlignCenter)
-        browse_label.setObjectName("browseLabel")
-
-        layout.addWidget(self.icon_label)
-        layout.addWidget(title_label)
-        layout.addWidget(or_label)
-        layout.addWidget(browse_label)
-
-    def set_icon(self, category):
-        icon_map = {
-            "Image": "image.svg",
-            "Video": "video.svg",
-            "Audio": "audio.svg",
-            "PDF": "pdf.svg",
-            "Archives": "archive.svg",
-            "Office": "office.svg",
-            "Favorites": "favorite.svg",
-        }
-        if category and category in icon_map:
-            icon_name = icon_map[category]
-        else:
-            icon_name = "image.svg"
-
-        icon_path = ICONS / icon_name
-        if icon_path.exists():
-            renderer = QSvgRenderer(str(icon_path))
-            if renderer.isValid():
-                pixmap = QPixmap(64, 64)
-                pixmap.fill(Qt.transparent)
-                painter = QPainter(pixmap)
-                renderer.render(painter)
-                painter.end()
-                self.icon_label.setPixmap(pixmap)
-                return
-
-        icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
-        if not icon.isNull():
-            self.icon_label.setPixmap(icon.pixmap(64, 64))
-        else:
-            self.icon_label.clear()
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        if files:
-            self.files_dropped.emit(files)
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.browse_requested.emit()
-        super().mousePressEvent(event)
-
-
-class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.resize(400, 320)
-
-        layout = QFormLayout(self)
-
-        self.dark_mode_checkbox = QCheckBox("Dark Mode")
-        self.follow_system_checkbox = QCheckBox("Follow System")
-        self.output_folder_combo = QComboBox()
-        self.output_folder_combo.addItems(["Same folder", "Ask every time", "Custom folder"])
-        self.language_combo = QComboBox()
-        self.language_combo.addItems(["English", "中文", "日本語"])
-        self.overwrite_combo = QComboBox()
-        self.overwrite_combo.addItems(["Rename", "Overwrite", "Skip"])
-        self.logging_combo = QComboBox()
-        self.logging_combo.addItems(["Verbose", "Normal", "Silent"])
-
-        layout.addRow(self.dark_mode_checkbox, self.follow_system_checkbox)
-        layout.addRow("Output Folder", self.output_folder_combo)
-        layout.addRow("Language", self.language_combo)
-        layout.addRow("Overwrite behavior", self.overwrite_combo)
-        layout.addRow("Logging", self.logging_combo)
-
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        layout.addRow(close_button)
-
-
-class AboutDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("About Everything Converter")
-        self.resize(420, 320)
-
-        layout = QFormLayout(self)
-        title = QLabel("<b>Everything Converter</b>")
-        title.setTextFormat(Qt.RichText)
-        layout.addRow(title)
-        layout.addRow("Version", QLabel(APP_VERSION))
-        layout.addRow("Build", QLabel(BUILD_TYPE))
-        layout.addRow("Python", QLabel(platform.python_version()))
-        layout.addRow("Qt", QLabel(QT_VERSION_STR))
-        layout.addRow("FFmpeg", QLabel(ffmpeg_version()))
-        homepage = QLabel('<a href="https://example.com">https://example.com</a>')
-        homepage.setOpenExternalLinks(True)
-        layout.addRow("Homepage", homepage)
-        layout.addRow("License", QLabel("MIT"))
-
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        layout.addRow(close_button)
+from converters.ffmpeg_base import FFmpegConverter
+from ui.options_dialog import ConversionOptionsDialog, PRESETS, DEFAULT_VIDEO_CODEC, DEFAULT_AUDIO_CODEC
+from ui.dialogs.settings_dialog import SettingsDialog
+from ui.dialogs.about_dialog import AboutDialog
+from ui.error_assistant import ErrorAssistant
+from ui.widgets.drop_area import DropArea
+from workers.conversion_worker import BatchConversionWorker
+from utils.media_info import get_media_info
+from services.size_estimator import estimate_output_size
+from controllers.queue_controller import QueueController
+from utils.formatter import format_short_duration, format_size
+from utils.output_builder import build_output_path
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Everything Converter")
-        self.resize(1100, 700)
-        self.selected_files = []
+        self.settings = QSettings("EverythingConverter", "Settings")
         self.available_converters = list(CONVERTERS)
         self.converter_thread = None
         self.current_speed = "0.00 MB/s"
+        self._output_files = []
+        self.queue_controller = QueueController()
+        self._row_options = {}
+        self._is_conversion_paused = False
+
+        self.load_general_settings()
 
         self._create_actions()
         self._create_menu_bar()
         self._create_tool_bar()
         self._create_status_bar()
         self._create_central_ui()
+        self.retranslate_ui()
+
+        self.tray_icon = None
+        self.setup_tray()
+
+    def retranslate_ui(self):
+        self.setWindowTitle(lang.lang.get("EverythingConverter"))
+        # Actions
+        self.exit_action.setText(lang.lang.get("Exit"))
+        self.open_action.setText(lang.lang.get("Open"))
+        self.convert_action.setText(lang.lang.get("Convert"))
+        self.settings_action.setText(lang.lang.get("Settings"))
+        self.about_action.setText(lang.lang.get("About Everything Converter"))
+        # Menu bar - since we don't store references, we set directly
+        file_menu = self.menuBar().actions()[0]
+        tools_menu = self.menuBar().actions()[1]
+        help_menu = self.menuBar().actions()[2]
+        file_menu.setText(lang.lang.get("File"))
+        tools_menu.setText(lang.lang.get("Tools"))
+        help_menu.setText(lang.lang.get("Help"))
+        # Status bar
+        self.statusBar().showMessage(lang.lang.get("Ready"))
+        # Drop area
+        self.drop_area.retranslate()
+        # Search placeholder
+        self.search_bar.setPlaceholderText(lang.lang.get("Search conversions..."))
+        # File queue header label
+        self.file_queue_label.setText(lang.lang.get("File Queue (each file can choose its own target format)"))
+        # Buttons
+        self.add_file_btn.setText(lang.lang.get("Add Files"))
+        self.clear_all_btn.setText(lang.lang.get("Clear All"))
+        # Converter list label
+        self.converter_list_label.setText(lang.lang.get("Converter List (global fallback if no per-file selection)"))
+        # Detected extension label
+        self.detected_extension_label.setText(lang.lang.get("Drop a file to detect available conversions"))
+        # Destination label
+        self.destination_label.setText(lang.lang.get("Destination path will appear after selecting a conversion"))
+        # Converter description label
+        self.converter_description_label.setText(lang.lang.get("Select a conversion to see the target format description"))
+        # Conversion view
+        self.conversion_title.setText(lang.lang.get("Converting files..."))
+        self.current_converter_label.setText(f"{lang.lang.get('Current Converter:')} -")
+        self.current_file_label.setText(f"{lang.lang.get('File:')} -")
+        self.conversion_info_label.setText("0 / 0 files | 0.00 MB/s")
+        # Timing labels (children of timing_container)
+        for child in self.timing_container.findChildren(QLabel):
+            if child.text() in ("Elapsed:", "已用时间:", "経過時間:"):
+                child.setText(lang.lang.get("Elapsed:"))
+            elif child.text() in ("Remaining:", "剩余时间:", "残り時間:"):
+                child.setText(lang.lang.get("Remaining:"))
+        self.pause_button.setText(lang.lang.get("Pause"))
+        self.cancel_button.setText(lang.lang.get("Cancel"))
+        # Completion panel
+        self.complete_label.setText(lang.lang.get("Conversion Complete!"))
+        self.open_folder_btn.setText(lang.lang.get("Open Folder"))
+        self.open_file_btn.setText(lang.lang.get("Open File"))
+        self.back_btn.setText(lang.lang.get("Back"))
+        # Sidebar items (they are set dynamically, but the first item is Favorites)
+        if self.sidebar.topLevelItemCount() > 0:
+            fav_item = self.sidebar.topLevelItem(0)
+            if fav_item:
+                fav_item.setText(0, f"{lang.lang.get('Favorites')} (0)")
+        # File formats header
+        if self.sidebar.topLevelItemCount() > 1:
+            formats_item = self.sidebar.topLevelItem(1)
+            if formats_item:
+                formats_item.setText(0, lang.lang.get("File Formats"))
+        # Refresh sidebar counts
+        self.update_sidebar_counts()
+
+    def load_general_settings(self):
+        dark = self.settings.value("dark_mode", False, type=bool)
+        if dark:
+            self.set_dark_mode(True)
+
+    def setup_tray(self):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon = QSystemTrayIcon(self)
+            icon_path = RESOURCES / "icon.ico"
+            if icon_path.exists():
+                self.tray_icon.setIcon(QIcon(str(icon_path)))
+            self.tray_icon.setVisible(True)
+
+    def show_notification(self, title, message):
+        if self.tray_icon:
+            self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 5000)
+
+    def set_dark_mode(self, enable):
+        if enable:
+            dark_style = """
+            QMainWindow { background: #2b2b2b; }
+            QTableWidget, QListWidget, QLineEdit, QComboBox, QSpinBox, QTimeEdit {
+                background: #3c3c3c; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 5px;
+            }
+            QTableWidget::item { color: #eee; }
+            QHeaderView::section { background: #3c3c3c; color: #eee; border: 1px solid #555; }
+            QFrame#dropArea { background: #3c3c3c; border: 2px dashed #6a6a6a; border-radius: 14px; }
+            QLabel { color: #eee; }
+            QPushButton { background: #4a4a4a; color: #eee; border: 1px solid #666; border-radius: 4px; padding: 6px; }
+            QPushButton:hover { background: #5a5a5a; }
+            QTreeWidget, QListWidget { background: #3c3c3c; color: #eee; }
+            QTreeWidget::item { color: #eee; }
+            QMenuBar { background: #2b2b2b; color: #eee; }
+            QMenuBar::item:selected { background: #4a4a4a; }
+            QStatusBar { background: #2b2b2b; color: #eee; }
+            QProgressBar { background: #3c3c3c; border: 1px solid #555; border-radius: 4px; }
+            QProgressBar::chunk { background: #4f7cff; }
+            QGroupBox { color: #eee; border: 1px solid #555; border-radius: 4px; margin-top: 10px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            QTabWidget::pane { background: #2b2b2b; border: 1px solid #555; }
+            QTabBar::tab { background: #3c3c3c; color: #eee; padding: 8px; }
+            QTabBar::tab:selected { background: #4a4a4a; }
+            """
+            self.setStyleSheet(dark_style)
+        else:
+            stylesheet_path = Path(__file__).parent / "styles.qss"
+            if stylesheet_path.exists():
+                self.setStyleSheet(stylesheet_path.read_text())
 
     def _create_actions(self):
-        self.exit_action = QAction("Exit", self)
+        self.exit_action = QAction(lang.lang.get("Exit"), self)
         self.exit_action.triggered.connect(self.close)
 
-        self.open_action = QAction("Open", self)
+        self.open_action = QAction(lang.lang.get("Open"), self)
         self.open_action.triggered.connect(self.browse_files)
 
-        self.convert_action = QAction("Convert", self)
+        self.convert_action = QAction(lang.lang.get("Convert"), self)
         self.convert_action.triggered.connect(self.convert_selected_files)
 
-        self.settings_action = QAction("Settings", self)
+        self.settings_action = QAction(lang.lang.get("Settings"), self)
         self.settings_action.triggered.connect(self.show_settings)
 
-        self.about_action = QAction("About", self)
+        self.about_action = QAction(lang.lang.get("About Everything Converter"), self)
         self.about_action.triggered.connect(self.show_about)
 
     def _create_menu_bar(self):
-        file_menu = self.menuBar().addMenu("File")
+        file_menu = self.menuBar().addMenu(lang.lang.get("File"))
         file_menu.addAction(self.exit_action)
 
-        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu = self.menuBar().addMenu(lang.lang.get("Tools"))
         tools_menu.addAction(self.settings_action)
 
-        help_menu = self.menuBar().addMenu("Help")
+        help_menu = self.menuBar().addMenu(lang.lang.get("Help"))
         help_menu.addAction(self.about_action)
 
     def _create_tool_bar(self):
@@ -345,7 +207,7 @@ class MainWindow(QMainWindow):
     def _create_status_bar(self):
         status_bar = QStatusBar(self)
         self.setStatusBar(status_bar)
-        status_bar.showMessage("Ready")
+        status_bar.showMessage(lang.lang.get("Ready"))
 
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setTextVisible(True)
@@ -358,52 +220,97 @@ class MainWindow(QMainWindow):
 
     def _create_central_ui(self):
         root = QWidget(self)
-        root_layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(12)
 
-        self.current_category = None
-        self.category_items = {}
-
+        # Sidebar
         self.sidebar = QTreeWidget()
         self.sidebar.setObjectName("sidebar")
         self.sidebar.setHeaderHidden(True)
-        self.sidebar.setRootIsDecorated(False)
-        self.sidebar.setFixedWidth(280)
-
-        # ★★★★★ Black text with white outline ★★★★★
+        self.sidebar.setRootIsDecorated(True)
+        self.sidebar.setMinimumWidth(150)
         self.sidebar.setStyleSheet("""
             QTreeWidget#sidebar::item {
                 color: black;
                 text-shadow: 1px 1px 0 white, -1px -1px 0 white, 1px -1px 0 white, -1px 1px 0 white;
             }
         """)
-
         self.sidebar.itemClicked.connect(self.on_sidebar_item_clicked)
+
+        self.category_items = {}
+        self.current_category = None
         self._build_sidebar()
 
+        # Main content
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setSpacing(12)
 
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Search conversions...")
+        self.search_bar.setPlaceholderText(lang.lang.get("Search conversions..."))
         self.search_bar.textChanged.connect(self.on_search_text_changed)
+
+        # File queue header with buttons
+        file_queue_widget = QWidget()
+        file_queue_layout = QHBoxLayout(file_queue_widget)
+        file_queue_layout.setContentsMargins(0, 0, 0, 0)
+        self.file_queue_label = QLabel(lang.lang.get("File Queue (each file can choose its own target format)"))
+        file_queue_layout.addWidget(self.file_queue_label)
+        file_queue_layout.addStretch()
+        self.add_file_btn = QPushButton(lang.lang.get("Add Files"))
+        self.add_file_btn.clicked.connect(self.browse_files)
+        self.clear_all_btn = QPushButton(lang.lang.get("Clear All"))
+        self.clear_all_btn.clicked.connect(self.clear_all_files)
+        file_queue_layout.addWidget(self.add_file_btn)
+        file_queue_layout.addWidget(self.clear_all_btn)
+
+        self.file_table = QTableWidget(0, 6)
+        self.file_table.setHorizontalHeaderLabels([
+            lang.lang.get("Filename"),
+            lang.lang.get("Target"),
+            lang.lang.get("Metadata"),
+            lang.lang.get("Estimate"),
+            lang.lang.get("Status"),
+            lang.lang.get("Options")
+        ])
+        self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.file_table.setColumnWidth(1, 190)
+        self.file_table.setColumnWidth(2, 240)
+        self.file_table.setColumnWidth(3, 190)
+        self.file_table.setColumnWidth(4, 140)
+        self.file_table.setColumnWidth(5, 72)
+        self.file_table.verticalHeader().setVisible(False)
+        self.file_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.file_table.setDragEnabled(False)
+        self.file_table.setMinimumHeight(150)
+        self.file_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_table.doubleClicked.connect(self._open_selected_row_options)
+        self.file_table.customContextMenuRequested.connect(self.show_file_context_menu)
+
+        self.main_convert_btn = QPushButton(lang.lang.get("Convert"))
+        self.main_convert_btn.setObjectName("mainConvertButton")
+        self.main_convert_btn.setMinimumHeight(42)
+        self.main_convert_btn.setStyleSheet("QPushButton#mainConvertButton { background: #2e7d32; color: white; font-weight: bold; }")
+        self.main_convert_btn.clicked.connect(self.convert_selected_files)
 
         self.drop_area = DropArea()
         self.drop_area.files_dropped.connect(self.handle_files)
         self.drop_area.browse_requested.connect(self.browse_files)
 
-        self.detected_extension_label = QLabel("Drop a file to detect available conversions")
+        self.detected_extension_label = QLabel(lang.lang.get("Drop a file to detect available conversions"))
         self.detected_extension_label.setObjectName("detectedExtensionLabel")
 
+        self.converter_list_label = QLabel(lang.lang.get("Converter List (global fallback if no per-file selection)"))
         self.converter_list = QListWidget()
         self.converter_list.setObjectName("converterList")
         self.converter_list.setMinimumHeight(110)
         self.converter_list.currentItemChanged.connect(self.update_converter_details)
         self.converter_list.itemDoubleClicked.connect(self.convert_selected_files)
 
-        self.converter_description_label = QLabel("Select a conversion to see the target format description")
+        self.converter_description_label = QLabel(lang.lang.get("Select a conversion to see the target format description"))
         self.converter_description_label.setObjectName("converterDescriptionLabel")
         self.converter_description_label.setWordWrap(True)
         self.converter_description_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -415,34 +322,39 @@ class MainWindow(QMainWindow):
         self.description_scroll_area.setMaximumHeight(150)
         self.description_scroll_area.setFrameShape(QFrame.StyledPanel)
 
-        self.destination_label = QLabel("Destination path will appear after selecting a conversion")
+        self.destination_label = QLabel(lang.lang.get("Destination path will appear after selecting a conversion"))
         self.destination_label.setObjectName("destinationLabel")
         self.destination_label.setWordWrap(True)
 
         content_layout.addWidget(self.search_bar)
         content_layout.addWidget(self.detected_extension_label)
-        content_layout.addWidget(self.drop_area, stretch=1)
-        content_layout.addWidget(QLabel("Converter List"))
+        content_layout.addWidget(self.drop_area)
+        content_layout.addWidget(file_queue_widget)
+        content_layout.addWidget(self.file_table)
+        content_layout.addWidget(self.main_convert_btn, alignment=Qt.AlignRight)
+        content_layout.addWidget(self.converter_list_label)
         content_layout.addWidget(self.converter_list)
         content_layout.addWidget(self.description_scroll_area)
         content_layout.addWidget(self.destination_label)
 
+        # Stacked widget
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(content)
 
+        # Conversion view
         conversion_view = QWidget()
         conversion_layout = QVBoxLayout(conversion_view)
         conversion_layout.setAlignment(Qt.AlignCenter)
         conversion_layout.setSpacing(16)
 
-        conversion_title = QLabel("Converting files...")
-        conversion_title.setObjectName("conversionTitle")
-        conversion_title.setAlignment(Qt.AlignCenter)
+        self.conversion_title = QLabel(lang.lang.get("Converting files..."))
+        self.conversion_title.setObjectName("conversionTitle")
+        self.conversion_title.setAlignment(Qt.AlignCenter)
 
-        self.current_converter_label = QLabel("Current Converter: -")
+        self.current_converter_label = QLabel(f"{lang.lang.get('Current Converter:')} -")
         self.current_converter_label.setAlignment(Qt.AlignCenter)
 
-        self.current_file_label = QLabel("File: -")
+        self.current_file_label = QLabel(f"{lang.lang.get('File:')} -")
         self.current_file_label.setAlignment(Qt.AlignCenter)
 
         self.conversion_progress_bar = QProgressBar()
@@ -456,56 +368,93 @@ class MainWindow(QMainWindow):
         self.conversion_info_label.setObjectName("conversionInfoLabel")
         self.conversion_info_label.setAlignment(Qt.AlignCenter)
 
-        timing_layout = QHBoxLayout()
-        timing_layout.addWidget(QLabel("Elapsed:"))
+        self.timing_container = QWidget()
+        timing_layout = QHBoxLayout(self.timing_container)
+        timing_layout.addWidget(QLabel(lang.lang.get("Elapsed:")))
         self.elapsed_label = QLabel("00:00:00")
         timing_layout.addWidget(self.elapsed_label)
         timing_layout.addStretch()
-        timing_layout.addWidget(QLabel("Remaining:"))
+        timing_layout.addWidget(QLabel(lang.lang.get("Remaining:")))
         self.remaining_label = QLabel("00:00:00")
         timing_layout.addWidget(self.remaining_label)
 
-        self.pause_button = QPushButton("Pause")
-        self.pause_button.clicked.connect(self.pause_conversion)
+        self.pause_button = QPushButton(lang.lang.get("Pause"))
+        self.pause_button.clicked.connect(self.toggle_pause_conversion)
 
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton(lang.lang.get("Cancel"))
         self.cancel_button.clicked.connect(self.cancel_conversion)
-
-        self.done_button = QPushButton("Done")
-        self.done_button.clicked.connect(self.finish_conversion)
-        self.done_button.setVisible(False)
 
         button_layout = QHBoxLayout()
         button_layout.addStretch()
         button_layout.addWidget(self.pause_button)
         button_layout.addWidget(self.cancel_button)
-        button_layout.addWidget(self.done_button)
         button_layout.addStretch()
 
+        # Completion panel
+        self.completion_widget = QWidget()
+        completion_layout = QVBoxLayout(self.completion_widget)
+        completion_layout.setAlignment(Qt.AlignCenter)
+        completion_layout.setSpacing(16)
+
+        self.complete_label = QLabel(lang.lang.get("Conversion Complete!"))
+        self.complete_label.setObjectName("completionTitle")
+        self.complete_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        self.complete_label.setAlignment(Qt.AlignCenter)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        btn_layout.setAlignment(Qt.AlignCenter)
+
+        folder_icon_path = ICONS / "folder.svg"
+        folder_icon = QIcon(str(folder_icon_path)) if folder_icon_path.exists() else QIcon()
+        self.open_folder_btn = QPushButton(folder_icon, lang.lang.get("Open Folder"))
+        self.open_folder_btn.clicked.connect(self._open_output_folder)
+
+        file_icon_path = ICONS / "file.svg"
+        file_icon = QIcon(str(file_icon_path)) if file_icon_path.exists() else QIcon()
+        self.open_file_btn = QPushButton(file_icon, lang.lang.get("Open File"))
+        self.open_file_btn.clicked.connect(self._open_output_file)
+
+        self.back_btn = QPushButton(lang.lang.get("Back"))
+        self.back_btn.clicked.connect(self._go_back_to_main)
+
+        btn_layout.addWidget(self.open_folder_btn)
+        btn_layout.addWidget(self.open_file_btn)
+        btn_layout.addWidget(self.back_btn)
+
+        completion_layout.addWidget(self.complete_label)
+        completion_layout.addLayout(btn_layout)
+        self.completion_widget.hide()
+
         conversion_layout.addStretch()
-        conversion_layout.addWidget(conversion_title)
+        conversion_layout.addWidget(self.conversion_title)
         conversion_layout.addWidget(self.current_converter_label)
         conversion_layout.addWidget(self.current_file_label)
         conversion_layout.addWidget(self.conversion_progress_bar)
         conversion_layout.addWidget(self.conversion_info_label)
-        conversion_layout.addLayout(timing_layout)
+        conversion_layout.addWidget(self.timing_container)
         conversion_layout.addLayout(button_layout)
+        conversion_layout.addWidget(self.completion_widget)
         conversion_layout.addStretch()
 
         self.content_stack.addWidget(conversion_view)
 
-        root_layout.addWidget(self.sidebar)
-        root_layout.addWidget(self.content_stack, stretch=1)
+        # Splitter
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.sidebar)
+        splitter.addWidget(self.content_stack)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([280, 800])
 
+        root_layout.addWidget(splitter)
         self.setCentralWidget(root)
 
+    # ---------- Sidebar methods ----------
     def _build_sidebar(self):
         self.sidebar.clear()
         self.category_items.clear()
-
         self.sidebar.setIconSize(QSize(40, 40))
 
-        # Mapping of category (or None for Favorites) to background JPG filename
         bg_map = {
             None: "favorite.jpg",
             "Image": "image.jpg",
@@ -523,17 +472,14 @@ class MainWindow(QMainWindow):
             bg_path = RESOURCES / "backgrounds" / jpg_name
             if bg_path.exists():
                 pixmap = QPixmap(str(bg_path))
-                # Scale to item's size hint (260x48) with cover behavior (crop to fill)
                 scaled = pixmap.scaled(260, 48, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
                 brush = QBrush(scaled)
                 item.setBackground(0, brush)
 
-        # Favorites item
-        favorites_item = QTreeWidgetItem(["Favorites (0)"])
+        favorites_item = QTreeWidgetItem([f"{lang.lang.get('Favorites')} (0)"])
         favorites_item.setData(0, Qt.UserRole, None)
         favorites_item.setSizeHint(0, QSize(260, 48))
         set_item_background(favorites_item, None)
-
         fav_icon_path = ICONS / "favorite.svg"
         if fav_icon_path.exists():
             renderer = QSvgRenderer(str(fav_icon_path))
@@ -544,18 +490,14 @@ class MainWindow(QMainWindow):
                 renderer.render(painter)
                 painter.end()
                 favorites_item.setIcon(0, QIcon(pixmap))
-            else:
-                icon = QIcon(str(fav_icon_path))
-                if not icon.isNull():
-                    favorites_item.setIcon(0, icon)
         self.sidebar.addTopLevelItem(favorites_item)
 
-        file_formats = QTreeWidgetItem(["File Formats"])
+        file_formats = QTreeWidgetItem([lang.lang.get("File Formats")])
         file_formats.setExpanded(True)
         self.sidebar.addTopLevelItem(file_formats)
 
         categories = [
-            ("Images", "image.svg", "Image"),
+            ("Image", "image.svg", "Image"),
             ("Video", "video.svg", "Video"),
             ("Audio", "audio.svg", "Audio"),
             ("PDF", "pdf.svg", "PDF"),
@@ -578,10 +520,6 @@ class MainWindow(QMainWindow):
                     renderer.render(painter)
                     painter.end()
                     item.setIcon(0, QIcon(pixmap))
-                else:
-                    icon = QIcon(str(icon_path))
-                    if not icon.isNull():
-                        item.setIcon(0, icon)
             item.setData(0, Qt.UserRole, category_name)
             file_formats.addChild(item)
             self.category_items[category_name] = item
@@ -615,351 +553,468 @@ class MainWindow(QMainWindow):
         if self.sidebar.topLevelItemCount() > 0:
             fav_item = self.sidebar.topLevelItem(0)
             if fav_item:
-                fav_item.setText(0, f"Favorites ({total_converters})")
+                fav_item.setText(0, f"{lang.lang.get('Favorites')} ({total_converters})")
 
     def filter_converters_by_category(self, converters):
         if not self.current_category:
             return converters
-        return [converter for converter in converters if converter.category.lower() == self.current_category.lower()]
+        return [c for c in converters if c.category.lower() == self.current_category.lower()]
 
-    def resolve_output_paths(self, converter):
-        file_pairs = []
-        for input_file in self.selected_files:
-            candidate = Path(input_file).with_suffix(converter.output_extension)
-            if candidate.exists():
-                candidate = self.ask_output_conflict(candidate)
-                if candidate is None:
-                    continue
-            file_pairs.append((input_file, str(candidate)))
-        return file_pairs
-
-    def ask_output_conflict(self, existing_path: Path):
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Output already exists")
-        dialog.setText(
-            f"The file already exists:\n{existing_path}\n\nChoose what to do:"
-        )
-        dialog.setIcon(QMessageBox.Warning)
-
-        overwrite_button = dialog.addButton("Yes", QMessageBox.YesRole)
-        no_button = dialog.addButton("No", QMessageBox.NoRole)
-        rename_button = dialog.addButton("Rename", QMessageBox.ActionRole)
-        skip_button = dialog.addButton("Skip", QMessageBox.RejectRole)
-        dialog.setDefaultButton(overwrite_button)
-        dialog.exec()
-
-        clicked = dialog.clickedButton()
-        if clicked == overwrite_button:
-            return existing_path
-        if clicked == no_button:
-            return self.get_unique_output(existing_path)
-        if clicked == rename_button:
-            text, ok = QInputDialog.getText(
-                self,
-                "Rename output file",
-                "New filename:",
-                text=existing_path.name,
-            )
-            if ok and text:
-                new_path = existing_path.with_name(text)
-                if new_path.exists():
-                    return self.get_unique_output(new_path)
-                return new_path
-            return None
-        return None
-
-    def get_unique_output(self, output_path: Path):
-        source = output_path
-        counter = 1
-        while source.exists():
-            source = source.with_name(f"{output_path.stem}_{counter}{output_path.suffix}")
-            counter += 1
-        return source
-
+    # ---------- File handling ----------
     def browse_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "Open files",
+            lang.lang.get("Open files"),
             "",
             "All files (*)",
         )
         if files:
             self.handle_files(files)
 
+    def clear_all_files(self):
+        if self.file_table.rowCount() == 0:
+            return
+        reply = QMessageBox.question(
+            self, lang.lang.get("Clear All"),
+            lang.lang.get("Remove all files from the conversion queue?"),
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.file_table.setRowCount(0)
+            self.queue_controller.clear()
+            self.drop_area.setVisible(True)
+            self.statusBar().showMessage(lang.lang.get("Queue cleared"))
+
     def handle_files(self, files):
-        self.selected_files = files
-        self.current_category = None
-        detected_extensions = sorted({Path(file_name).suffix.lower() for file_name in files})
-        compatible_converters = []
+        for file_path in files:
+            self._add_file_to_table(file_path)
+        self.drop_area.setVisible(True)
+        self.statusBar().showMessage(f"{self.file_table.rowCount()} {lang.lang.get('file(s) in queue')}")
 
-        for extension in detected_extensions:
-            compatible_converters.extend(find_converters(extension))
+    def _add_file_to_table(self, file_path):
+        if not self.queue_controller.add(file_path):
+            self.statusBar().showMessage(lang.lang.get("File already in queue"))
+            return
 
-        self.available_converters = list(dict.fromkeys(compatible_converters))
+        row = self.file_table.rowCount()
+        self.file_table.insertRow(row)
 
-        if detected_extensions:
-            extension_text = ", ".join(extension or "[no extension]" for extension in detected_extensions)
-            self.detected_extension_label.setText(f"Detected: {extension_text}")
-        else:
-            self.detected_extension_label.setText("No file extension detected")
+        name_item = QTableWidgetItem(Path(file_path).name)
+        name_item.setData(Qt.UserRole, file_path)
+        self.file_table.setItem(row, 0, name_item)
 
-        self.refresh_converter_list()
-
-        if self.available_converters:
-            self.converter_list.setCurrentRow(0)
-            self.statusBar().showMessage(f"{len(files)} file(s) ready — choose a conversion")
-        else:
-            self.statusBar().showMessage("No converter found")
-
-    def refresh_converter_list(self):
-        query = self.search_bar.text()
-        converters = search_converters(query, self.available_converters)
-        converters = self.filter_converters_by_category(converters)
-        self.converter_list.clear()
-
-        for converter in converters:
-            input_extensions = ", ".join(extension.upper().lstrip(".") for extension in converter.input_extensions)
-            output_extension = converter.output_extension.upper().lstrip(".")
-            self.converter_list.addItem(f"{input_extensions} → {output_extension}")
-            self.converter_list.item(self.converter_list.count() - 1).setData(Qt.UserRole, converter)
-
+        combo = QComboBox()
+        converters = find_converters(file_path)
         if converters:
-            self.converter_list.setCurrentRow(0)
-        elif query:
-            self.converter_list.addItem("No conversions match your search")
+            for conv in converters:
+                combo.addItem(f"{conv.output_extension.upper()}", conv)
+            combo.setCurrentIndex(0)
         else:
-            self.converter_list.addItem("No conversions available for the selected file type")
+            combo.addItem(lang.lang.get("无可用转换"), None)
+            combo.setEnabled(False)
+        self.file_table.setCellWidget(row, 1, combo)
 
-        self.update_converter_details()
+        metadata = self._format_queue_metadata(file_path)
+        self.file_table.setItem(row, 2, QTableWidgetItem(metadata))
 
-    def selected_converter(self):
-        current_item = self.converter_list.currentItem()
-        if current_item is None:
-            return None
-        return current_item.data(Qt.UserRole)
+        estimate_item = QTableWidgetItem(self._estimate_output_size_text(file_path, combo.currentData() if converters else None, {}))
+        self.file_table.setItem(row, 3, estimate_item)
 
-    def _update_conversion_controls(self, enabled: bool):
-        self.convert_action.setEnabled(enabled)
-        self.converter_list.setEnabled(enabled)
+        status_item = QTableWidgetItem("🟢 Ready")
+        status_item.setTextAlignment(Qt.AlignCenter)
+        self.file_table.setItem(row, 4, status_item)
 
-    def _on_conversion_progress(self, index: int):
-        self.progress_bar.setValue(index)
-        if self.converter_thread:
-            total = len(self.converter_thread.file_pairs)
-            percentage = int((index / total) * 100) if total > 0 else 0
-            self.conversion_progress_bar.setValue(percentage)
-            self.conversion_info_label.setText(f"{index} / {total} files | {self.current_speed}")
+        combo.currentIndexChanged.connect(lambda _idx, r=row: self._refresh_row_estimate(r))
 
-    def _on_conversion_status(self, message: str):
+        options_btn = QPushButton("⚙")
+        options_btn.setFixedSize(32, 24)
+        options_btn.clicked.connect(lambda _, r=row: self._open_row_options(r))
+        self.file_table.setCellWidget(row, 5, options_btn)
+
+        self._row_options[row] = {}
+        self._update_queue_preview()
+
+    def _format_queue_metadata(self, file_path):
+        info = get_media_info(file_path) or {}
+        ext = Path(file_path).suffix.lower()
+        size = Path(file_path).stat().st_size if Path(file_path).exists() else 0
+        parts = []
+
+        if info.get("width") and info.get("height"):
+            parts.append(f"{info['width']}×{info['height']}")
+        if info.get("video_codec"):
+            parts.append(info["video_codec"].upper())
+        if info.get("fps"):
+            parts.append(f"{float(info['fps']):.0f} FPS")
+        if info.get("duration"):
+            parts.append(format_short_duration(info["duration"]))
+        if info.get("audio_codec"):
+            parts.append(info["audio_codec"].upper())
+        if info.get("sample_rate"):
+            rate_khz = info["sample_rate"] / 1000.0
+            parts.append(f"{rate_khz:.1f} kHz")
+        if info.get("channels"):
+            channels_name = "Stereo" if info["channels"] >= 2 else "Mono"
+            parts.append(channels_name)
+        if info.get("bits_per_sample"):
+            parts.append(f"{info['bits_per_sample']}-bit")
+
+        if not parts:
+            if ext in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}:
+                parts.append(Path(file_path).suffix.upper().lstrip("."))
+            elif ext in {".mp3", ".flac", ".wav", ".ogg", ".aac", ".m4a"}:
+                parts.append(Path(file_path).suffix.upper().lstrip("."))
+            elif size:
+                parts.append(format_size(size))
+            else:
+                parts.append("—")
+
+        return " | ".join(parts) if parts else "—"
+
+    def _estimate_output_size_text(self, file_path, converter, opts):
+        size = Path(file_path).stat().st_size if Path(file_path).exists() else 0
+        if not size:
+            return "—"
+        estimate = estimate_output_size(
+            file_path,
+            converter,
+            opts,
+            default_preset=self.settings.value("default_preset", "None", type=str),
+        )
+        return (
+            f"≈{format_size(estimate['estimated'])} | "
+            f"Save {format_size(estimate['saved'])} "
+            f"({estimate['percent']:.0f}%) {estimate['confidence']}"
+        )
+
+    def _refresh_row_estimate(self, row):
+        if row < 0 or row >= self.file_table.rowCount():
+            return
+        item = self.file_table.item(row, 0)
+        combo = self.file_table.cellWidget(row, 1)
+        if not item or not combo:
+            return
+        self.file_table.setItem(row, 3, QTableWidgetItem(
+            self._estimate_output_size_text(item.data(Qt.UserRole), combo.currentData(), self._row_options.get(row, {}))
+        ))
+        self._update_queue_preview()
+
+    def _open_row_options(self, row):
+        file_path = self.file_table.item(row, 0).data(Qt.UserRole)
+        converter = self.file_table.cellWidget(row, 1).currentData() if self.file_table.cellWidget(row, 1) else None
+        if converter is None:
+            converter = self.selected_converter()
+        if converter is None:
+            QMessageBox.warning(self, lang.lang.get("No converter"), lang.lang.get("Please select a converter first."))
+            return
+
+        dlg = ConversionOptionsDialog([file_path], converter, self, initial_options=self._row_options.get(row, {}))
+        if dlg.exec() == QDialog.Accepted:
+            opts = dlg.get_options()
+            self._row_options[row] = opts
+            self._refresh_row_estimate(row)
+            self._update_queue_preview()
+
+    def _open_selected_row_options(self):
+        row = self.file_table.currentRow()
+        if row >= 0:
+            self._open_row_options(row)
+
+    def _update_queue_preview(self):
+        current_row = self.file_table.currentRow()
+        if current_row >= 0:
+            file_path = self.file_table.item(current_row, 0).data(Qt.UserRole)
+            combo = self.file_table.cellWidget(current_row, 1)
+            converter = combo.currentData() if combo else None
+            if converter is None:
+                self.destination_label.setText(lang.lang.get("Destination path will appear after selecting a conversion"))
+                return
+            preview = build_output_path(file_path, converter.output_extension, self.settings)
+            self.destination_label.setText(f"{lang.lang.get('Output:')} {preview}")
+
+    # ---------- Conversion ----------
+    def convert_selected_files(self):
+        if self.converter_thread and self.converter_thread.isRunning():
+            QMessageBox.information(self, lang.lang.get("Conversion in progress"), lang.lang.get("Please wait."))
+            return
+        if self.file_table.rowCount() == 0:
+            QMessageBox.information(self, lang.lang.get("No files"), lang.lang.get("Add files first."))
+            return
+
+        task_list = []
+        delete_source = False
+        shutdown = False
+        for row in range(self.file_table.rowCount()):
+            name_item = self.file_table.item(row, 0)
+            input_file = name_item.data(Qt.UserRole)
+            combo = self.file_table.cellWidget(row, 1)
+            converter = combo.currentData() if combo else None
+            if converter is None:
+                converter = self.selected_converter()
+            if converter is None:
+                continue
+
+            opts = dict(self._row_options.get(row, {}))
+            opts.setdefault("preset", self.settings.value("default_preset", "None", type=str))
+            opts.setdefault("copy_mode", False)
+            opts.setdefault("copy_audio", False)
+            opts.setdefault("start_time", None)
+            opts.setdefault("end_time", None)
+            opts.setdefault("threads", self.settings.value("default_threads", 0, type=int))
+            opts.setdefault("delete_source", False)
+            opts.setdefault("shutdown", False)
+            opts.setdefault("extra_args", [])
+            opts.setdefault("video_codec", DEFAULT_VIDEO_CODEC.get(converter.output_extension, None))
+            opts.setdefault("audio_codec", DEFAULT_AUDIO_CODEC.get(converter.output_extension, None))
+
+            preset_args = PRESETS.get(opts.get("preset", "None"), [])
+            extra_args = list(opts.get("extra_args", [])) + list(preset_args)
+            threads = opts.get("threads", 0)
+            copy_mode = opts.get("copy_mode", False)
+            copy_audio = opts.get("copy_audio", False)
+            start_time = opts.get("start_time")
+            end_time = opts.get("end_time")
+            scale = opts.get("scale")
+            video_codec = opts.get("video_codec")
+            audio_codec = opts.get("audio_codec")
+
+            if "crf" in opts:
+                extra_args.extend(["-crf", str(opts["crf"])])
+            if "video_bitrate" in opts:
+                extra_args.extend(["-b:v", f"{opts['video_bitrate']}k"])
+            if "audio_bitrate" in opts:
+                extra_args.extend(["-b:a", f"{opts['audio_bitrate']}k"])
+            if "sample_rate" in opts:
+                extra_args.extend(["-ar", str(opts["sample_rate"])])
+            if "start_time" in opts and opts["start_time"] is not None:
+                extra_args.extend(["-ss", str(opts["start_time"])])
+            if "end_time" in opts and opts["end_time"] is not None:
+                extra_args.extend(["-to", str(opts["end_time"])])
+            if scale:
+                extra_args.extend(["-vf", f"scale={scale}"])
+
+            output_path = build_output_path(input_file, converter.output_extension, self.settings)
+            configured_converter = self._configured_converter(converter, opts, extra_args)
+            task_list.append((configured_converter, input_file, output_path))
+            self._set_row_status(row, "🟡 Waiting")
+
+        if not task_list:
+            QMessageBox.warning(self, lang.lang.get("No converter"), lang.lang.get("No queued file has an available converter."))
+            return
+
+        self._output_files = [output_file for _, _, output_file in task_list]
+        self.progress_bar.setMaximum(len(task_list))
+        self.progress_bar.setValue(0)
+        self.conversion_progress_bar.setValue(0)
+        self.conversion_info_label.setText(f"0 / {len(task_list)} files | 0.00 MB/s")
+
+        logger.info("Starting conversion:")
+        for idx, (converter, input_file, output_file) in enumerate(task_list, start=1):
+            logger.info(f"  {idx}. {converter.name}: {input_file} -> {output_file}")
+
+        self.converter_thread = BatchConversionWorker(task_list, delete_source=delete_source)
+        self.converter_thread.progress_updated.connect(self.update_conversion_progress)
+        self.converter_thread.per_file_progress.connect(self.update_per_file_progress)
+        self.converter_thread.status_message.connect(self.update_status_message)
+        self.converter_thread.speed_updated.connect(self.update_speed)
+        self.converter_thread.current_file_updated.connect(self.update_current_file)
+        self.converter_thread.time_updated.connect(self.update_time_labels)
+        self.converter_thread.conversion_finished.connect(self.finish_conversion)
+
+        self.set_ui_enabled(False)
+        self.converter_thread.start()
+
+    def update_conversion_progress(self, value):
+        self.progress_bar.setValue(value)
+        total = self.progress_bar.maximum()
+        self.conversion_info_label.setText(f"{value} / {total} files | {self.current_speed}")
+
+    def update_per_file_progress(self, value):
+        self.conversion_progress_bar.setValue(value)
+
+    def update_status_message(self, message):
         self.statusBar().showMessage(message)
 
-    def _on_conversion_speed(self, speed: str):
+    def update_speed(self, speed):
         self.current_speed = speed
-        if self.converter_thread:
-            total = len(self.converter_thread.file_pairs)
-            index = self.progress_bar.value()
-            self.conversion_info_label.setText(f"{index} / {total} files | {speed}")
+        total = self.progress_bar.maximum()
+        done = self.progress_bar.value()
+        self.conversion_info_label.setText(f"{done} / {total} files | {speed}")
 
-    def _on_current_file(self, filename: str):
-        self.current_file_label.setText(f"File: {filename}")
+    def update_current_file(self, file_name):
+        self.current_file_label.setText(f"{lang.lang.get('File:')} {file_name}")
+        self._set_row_status_by_filename(file_name, "🔵 Processing")
 
-    def _on_time_update(self, elapsed: str, remaining: str):
+    def update_time_labels(self, elapsed, remaining):
         self.elapsed_label.setText(elapsed)
         self.remaining_label.setText(remaining)
 
-    def _on_conversion_finished(self, converted: int, errors: list):
-        self._update_conversion_controls(True)
-        self.progress_bar.setValue(0)
-        self.pause_button.setVisible(False)
-        self.cancel_button.setVisible(False)
-        self.done_button.setVisible(True)
+    def finish_conversion(self, converted, errors):
+        self.set_ui_enabled(True)
+        self.progress_bar.setValue(100)
         self.conversion_progress_bar.setValue(100)
+        self.statusBar().showMessage(lang.lang.get("Conversion complete"))
 
-        if errors:
-            self.statusBar().showMessage("Error")
-        elif converted:
-            self.statusBar().showMessage("Done")
+        self._mark_conversion_finished_rows(converted, errors)
+        self.completion_widget.show()
+
+        if errors and len(errors) > 0:
+            error_message = lang.lang.get("Conversion completed with errors:")
+            for error in errors:
+                error_message += f"\n- {error}"
+            QMessageBox.warning(self, lang.lang.get("Errors occurred"), error_message)
         else:
-            self.statusBar().showMessage("Ready")
+            QMessageBox.information(self, lang.lang.get("Success"), lang.lang.get("All files converted successfully"))
 
-    def pause_conversion(self):
-        if self.converter_thread:
-            self.converter_thread.pause()
-            self.pause_button.setText("Resume")
-            self.pause_button.clicked.disconnect()
-            self.pause_button.clicked.connect(self.resume_conversion)
+        # Update row statuses
+        for row in range(self.file_table.rowCount()):
+            name_item = self.file_table.item(row, 0)
+            input_file = name_item.data(Qt.UserRole)
+            combo = self.file_table.cellWidget(row, 1)
+            converter = combo.currentData() if combo else None
 
-    def resume_conversion(self):
-        if self.converter_thread:
-            self.converter_thread.resume()
-            self.pause_button.setText("Pause")
-            self.pause_button.clicked.disconnect()
-            self.pause_button.clicked.connect(self.pause_conversion)
+            if converter is None:
+                continue
 
-    def cancel_conversion(self):
-        if self.converter_thread:
-            self.converter_thread.cancel()
+            file_name = Path(input_file).name
+            failed_names = {str(err).split(":", 1)[0].strip() for err in errors}
+            if file_name in failed_names:
+                self._set_row_status(row, "🔴 Failed ✕")
+            else:
+                self._set_row_status(row, "✅ Done ✓")
 
-    def finish_conversion(self):
-        converted = self.converter_thread.converted if self.converter_thread else 0
-        errors = self.converter_thread.errors if self.converter_thread else []
-
-        if errors:
-            QMessageBox.warning(self, "Conversion finished with errors", "\n".join(errors))
-        elif converted:
-            QMessageBox.information(self, "Conversion complete", f"Converted {converted} file(s).")
-
-        self.content_stack.setCurrentIndex(0)
-        self.pause_button.setVisible(True)
-        self.cancel_button.setVisible(True)
-        self.done_button.setVisible(False)
-        self.pause_button.setText("Pause")
-        self.pause_button.clicked.disconnect()
-        self.pause_button.clicked.connect(self.pause_conversion)
-
-    def _describe_extension(self, extension):
-        description = EXTENSION_DESCRIPTIONS.get(extension.lower(), "Unknown file type")
-        return f"{extension.upper()} — {description}"
-
-    def update_converter_details(self):
-        converter = self.selected_converter()
-        if converter is None:
-            self.converter_description_label.setText("Select a conversion to see the target format description")
-            self.destination_label.setText("Destination path will appear after selecting a conversion")
+    def _set_row_status(self, row, text):
+        if row < 0 or row >= self.file_table.rowCount():
             return
+        item = self.file_table.item(row, 4)
+        if item is None:
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(Qt.AlignCenter)
+            self.file_table.setItem(row, 4, item)
+        else:
+            item.setText(text)
+            item.setTextAlignment(Qt.AlignCenter)
 
-        output_extension = converter.output_extension
+    def _set_row_status_by_filename(self, filename, text):
+        for row in range(self.file_table.rowCount()):
+            item = self.file_table.item(row, 0)
+            if item and Path(item.data(Qt.UserRole)).name == filename:
+                self._set_row_status(row, text)
+                return
+
+    def _mark_conversion_finished_rows(self, converted, errors):
+        failed_names = set()
+        for err in errors:
+            failed_names.add(str(err).split(":", 1)[0].strip())
+
+        for row in range(self.file_table.rowCount()):
+            file_name = Path(self.file_table.item(row, 0).data(Qt.UserRole)).name
+            if file_name in failed_names:
+                self._set_row_status(row, "🔴 Failed ✕")
+            else:
+                self._set_row_status(row, "✅ Done ✓")
+    # ---------- Converter list and app actions ----------
+    def refresh_converter_list(self):
+        self.converter_list.clear()
+        converters = self.filter_converters_by_category(search_converters(self.search_bar.text(), self.available_converters))
+        for converter in converters:
+            item = QListWidgetItem(f"{converter.name} ({converter.output_extension.upper()})")
+            item.setData(Qt.UserRole, converter)
+            self.converter_list.addItem(item)
+
+    def selected_converter(self):
+        item = self.converter_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def update_converter_details(self, current, previous=None):
+        converter = current.data(Qt.UserRole) if current else None
+        if not converter:
+            self.converter_description_label.setText(lang.lang.get("Select a conversion to see the target format description"))
+            self.destination_label.setText(lang.lang.get("Destination path will appear after selecting a conversion"))
+            return
+        inputs = ", ".join(converter.input_extensions)
+        desc = EXTENSION_DESCRIPTIONS.get(converter.output_extension.lower(), "")
         self.converter_description_label.setText(
-            f"Target format: {self._describe_extension(output_extension)}"
+            f"{converter.name}\nInput: {inputs}\nOutput: {converter.output_extension.upper()}\n{desc}"
         )
+        self._update_queue_preview()
 
-        if self.selected_files:
-            destination_example = self._build_output_path(self.selected_files[0], output_extension)
-            self.destination_label.setText(
-                f"Destination example: {destination_example}"
+    def _configured_converter(self, converter, opts, extra_args):
+        if isinstance(converter, FFmpegConverter):
+            return FFmpegConverter(
+                converter.name, converter.input_extensions, converter.output_extension,
+                video_codec=opts.get("video_codec"), audio_codec=opts.get("audio_codec"),
+                extra_args=extra_args, threads=opts.get("threads", 0),
+                copy_mode=opts.get("copy_mode", False), copy_audio=opts.get("copy_audio", False),
+                start_time=opts.get("start_time"), end_time=opts.get("end_time"),
+                scale=opts.get("scale")
             )
-        else:
-            self.destination_label.setText("Destination example: Select files to show the output path")
+        return converter
 
-    def convert_selected_files(self):
-        """Start the conversion process with user-specified options."""
-        # 1. Check if a conversion is already running
-        if self.converter_thread and self.converter_thread.isRunning():
-            QMessageBox.information(
-                self,
-                "Conversion in progress",
-                "Please wait until the current conversion finishes."
-            )
+    def show_file_context_menu(self, pos):
+        row = self.file_table.currentRow()
+        if row < 0:
             return
+        menu = QMenu(self)
+        edit_action = menu.addAction(lang.lang.get("Edit Options"))
+        remove_action = menu.addAction(lang.lang.get("Remove"))
+        open_folder_action = menu.addAction(lang.lang.get("Reveal Output Folder"))
+        copy_path_action = menu.addAction(lang.lang.get("Copy Path"))
+        action = menu.exec_(self.file_table.viewport().mapToGlobal(pos))
+        if action == edit_action:
+            self._open_row_options(row)
+        elif action == remove_action:
+            item = self.file_table.item(row, 0)
+            if item:
+                self.queue_controller.discard(item.data(Qt.UserRole))
+            self.file_table.removeRow(row)
+        elif action == open_folder_action:
+            self._open_output_folder()
+        elif action == copy_path_action:
+            item = self.file_table.item(row, 0)
+            if item:
+                QApplication.clipboard().setText(item.data(Qt.UserRole))
 
-        # 2. Ensure files are selected
-        if not self.selected_files:
-            self.statusBar().showMessage("Ready")
-            QMessageBox.information(
-                self,
-                "No files selected",
-                "Drop files or click Open before converting."
-            )
-            return
+    def set_ui_enabled(self, enabled):
+        self.convert_action.setEnabled(enabled)
+        self.main_convert_btn.setEnabled(enabled)
+        # Keep queue browsing and adding files available while conversion runs.
+        self.open_action.setEnabled(True)
+        self.add_file_btn.setEnabled(True)
+        self.clear_all_btn.setEnabled(True)
+        self.converter_list.setEnabled(True)
+        self.file_table.setEnabled(True)
+        self.content_stack.setCurrentIndex(0 if enabled else 1)
 
-        # 3. Ensure a converter is selected
-        converter = self.selected_converter()
-        if converter is None:
-            self.statusBar().showMessage("No converter selected")
-            QMessageBox.warning(
-                self,
-                "No converter selected",
-                "Select a conversion from the list first."
-            )
-            return
+    def _open_output_folder(self):
+        path = Path(self._output_files[0]).parent if self._output_files else Path.cwd()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
-        # 4. Show the options dialog and get user settings
-        from ui.options_dialog import ConversionOptionsDialog
-        options_dialog = ConversionOptionsDialog(self.selected_files, converter, self)
-        if options_dialog.exec() != QDialog.Accepted:
-            # User cancelled the options dialog
-            return
+    def _open_output_file(self):
+        if self._output_files:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._output_files[0]))
 
-        user_options = options_dialog.get_options()
-
-        # 5. Resolve output file paths (handle conflicts)
-        output_pairs = self.resolve_output_paths(converter)
-        if not output_pairs:
-            self.statusBar().showMessage("Conversion canceled")
-            return
-
-        # 6. Prepare UI for conversion
-        total_files = len(output_pairs)
-        self.progress_bar.setMinimum(0)
-        self.progress_bar.setMaximum(total_files)
-        self.progress_bar.setValue(0)
-        self.statusBar().showMessage("Starting conversion...")
-        self._update_conversion_controls(False)
-
-        self.current_speed = "0.00 MB/s"
-        self.conversion_progress_bar.setValue(0)
-        self.conversion_info_label.setText(f"0 / {total_files} files | {self.current_speed}")
-        self.pause_button.setVisible(True)
-        self.cancel_button.setVisible(True)
-        self.done_button.setVisible(False)
-        self.pause_button.setText("Pause")
-        self.content_stack.setCurrentIndex(1)
-
-        self.current_converter_label.setText(f"Current Converter: {converter.name}")
-
-        # 7. Build extra ffmpeg arguments from user options
-        extra_args = []
-        if "crf" in user_options:
-            extra_args.extend(["-crf", str(user_options["crf"])])
-        if "video_bitrate" in user_options:
-            extra_args.extend(["-b:v", f"{user_options['video_bitrate']}k"])
-        if "scale" in user_options and user_options["scale"]:
-            extra_args.extend(["-vf", f"scale={user_options['scale']}"])
-        if "audio_bitrate" in user_options:
-            extra_args.extend(["-b:a", f"{user_options['audio_bitrate']}k"])
-        if "sample_rate" in user_options:
-            extra_args.extend(["-ar", str(user_options["sample_rate"])])
-        if "extra_args" in user_options:
-            extra_args.extend(user_options["extra_args"])
-
-        # 8. Apply overrides to the converter instance
-        converter.set_override(
-            video_codec=user_options.get("video_codec"),
-            audio_codec=user_options.get("audio_codec"),
-            extra_args=extra_args
-        )
-
-        # 9. Create and start the worker thread
-        self.converter_thread = ConversionWorker(converter, output_pairs)
-        self.converter_thread.progress_updated.connect(self._on_conversion_progress)
-        self.converter_thread.status_message.connect(self._on_conversion_status)
-        self.converter_thread.speed_updated.connect(self._on_conversion_speed)
-        self.converter_thread.per_file_progress.connect(self._on_file_progress)
-        self.converter_thread.current_file_updated.connect(self._on_current_file)
-        self.converter_thread.time_updated.connect(self._on_time_update)
-        self.converter_thread.conversion_finished.connect(self._on_conversion_finished)
-        self.converter_thread.start()
-
-    def _on_file_progress(self, percent: int):
-        self.conversion_progress_bar.setValue(percent)
-        if self.converter_thread:
-            total = len(self.converter_thread.file_pairs)
-            index = self.progress_bar.value()
-            self.conversion_info_label.setText(f"{index} / {total} files | {self.current_speed}")
-
-    def _build_output_path(self, input_file, output_extension):
-        source = Path(input_file)
-        output = source.with_suffix(output_extension)
-        counter = 1
-
-        while output.exists():
-            output = source.with_name(f"{source.stem}_{counter}{output_extension}")
-            counter += 1
-
-        return str(output)
+    def _go_back_to_main(self):
+        self.completion_widget.hide()
+        self.content_stack.setCurrentIndex(0)
 
     def show_settings(self):
         SettingsDialog(self).exec()
 
     def show_about(self):
         AboutDialog(self).exec()
+
+    def toggle_pause_conversion(self):
+        if not self.converter_thread:
+            return
+        if self._is_conversion_paused:
+            self.converter_thread.resume()
+            self.pause_button.setText(lang.lang.get("Pause"))
+        else:
+            self.converter_thread.pause()
+            self.pause_button.setText(lang.lang.get("Resume"))
+        self._is_conversion_paused = not self._is_conversion_paused
+
+    def cancel_conversion(self):
+        if self.converter_thread:
+            self.converter_thread.cancel()

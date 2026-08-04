@@ -1,6 +1,7 @@
 """
 Video and Audio converters using the generic FFmpegConverter.
 All converters are generated from preset lists.
+Also includes audio extraction from video.
 """
 from .ffmpeg_base import FFmpegConverter
 
@@ -74,6 +75,34 @@ for name, ins, out, vcodec, acodec in audio_presets:
     audio_converters.append(c)
 
 # ---------------------------------------------------------------------
+# AUDIO EXTRACTION from video (video inputs → audio outputs)
+# ---------------------------------------------------------------------
+video_exts = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".3gp", ".wmv")
+audio_outputs = [
+    (".mp3", "libmp3lame"),
+    (".aac", "aac"),
+    (".flac", "flac"),
+    (".wav", "pcm_s16le"),
+    (".ogg", "libvorbis"),
+    (".m4a", "aac"),
+]
+
+extraction_converters = []
+for input_ext in video_exts:
+    for out_ext, acodec in audio_outputs:
+        name = f"Extract Audio from {input_ext[1:].upper()} to {out_ext[1:].upper()}"
+        c = FFmpegConverter(
+            name,
+            (input_ext,),
+            out_ext,
+            video_codec=None,
+            audio_codec=acodec,
+            extra_args=["-vn"],   # remove video
+        )
+        c.category = "Audio"  # put in Audio category for UI
+        extraction_converters.append(c)
+
+# ---------------------------------------------------------------------
 # Export combined list for registry
 # ---------------------------------------------------------------------
-ALL_FFMPEG_CONVERTERS = video_converters + audio_converters
+ALL_FFMPEG_CONVERTERS = video_converters + audio_converters + extraction_converters
