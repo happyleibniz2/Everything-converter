@@ -1,444 +1,498 @@
-import os
+"""Per-file (or per-batch) encoding options.
+
+Accepts and returns :class:`ConversionOptions` rather than a loose dict, so the
+UI and the conversion layer cannot drift apart. When ``batch_count`` exceeds one,
+the sheet presents itself as editing many files at once.
+"""
+
 from pathlib import Path
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSpinBox,
-    QSlider, QPushButton, QFormLayout, QGroupBox, QCheckBox,
-    QFileDialog, QTabWidget, QLineEdit, QWidget, QMessageBox
+from PySide6.QtWidgets import QFormLayout, QHBoxLayout, QStackedWidget, QWidget
+
+from qfluentwidgets import (
+    BodyLabel, CaptionLabel, CheckBox, ComboBox, LineEdit, MessageBoxBase,
+    Pivot, Slider, SpinBox, SubtitleLabel, ToolTipFilter,
 )
-from utils.paths import ICONS
-from utils.media_info import get_media_info
 
-# Codec mappings
-VIDEO_CODECS = {
-    "libx264": "H.264 (x264)",
-    "libx265": "H.265 / HEVC",
-    "libvpx": "VP8",
-    "libvpx-vp9": "VP9",
-    "mpeg4": "MPEG-4",
-    "wmv2": "WMV2",
-    "libxvid": "Xvid",
-}
-AUDIO_CODECS = {
-    "aac": "AAC",
-    "libmp3lame": "MP3",
-    "flac": "FLAC",
-    "pcm_s16le": "WAV (PCM)",
-    "libvorbis": "Vorbis",
-    "opus": "Opus",
-}
-DEFAULT_VIDEO_CODEC = {
-    ".mp4": "libx264",
-    ".mkv": "libx264",
-    ".mov": "libx264",
-    ".avi": "libx264",
-    ".webm": "libvpx",
-    ".flv": "libx264",
-    ".3gp": "libx264",
-    ".wmv": "wmv2",
-}
-DEFAULT_AUDIO_CODEC = {
-    ".mp3": "libmp3lame",
-    ".aac": "aac",
-    ".flac": "flac",
-    ".wav": "pcm_s16le",
-    ".ogg": "libvorbis",
-    ".m4a": "aac",
-}
+import lang
+from converters.presets import (
+    AUDIO_BITRATE_CHOICES, AUDIO_CODECS, AUDIO_SAMPLE_RATES,
+    DEFAULT_AUDIO_CODEC, DEFAULT_VIDEO_CODEC, PRESETS, PRESET_DESCRIPTIONS,
+    RESOLUTION_PRESETS, VIDEO_CODECS, category_for_extension,
+)
+from models.conversion_options import ConversionOptions
+from utils.formatter import format_short_duration, format_size
 
-# Presets
-PRESETS = {
-    "None": [],
-    "Fast (web friendly)": ["-preset", "veryfast", "-crf", "28"],
-    "High Quality (local)": ["-preset", "slow", "-crf", "18"],
-    "Small Size (mobile)": ["-preset", "veryfast", "-crf", "32", "-vf", "scale=640:-2"],
-    "Lossless (large)": ["-preset", "slow", "-crf", "0"],
-}
+# Re-exported so existing importers of these tables keep working.
+__all__ = [
+    "ConversionOptionsDialog", "VIDEO_CODECS", "AUDIO_CODECS",
+    "DEFAULT_VIDEO_CODEC", "DEFAULT_AUDIO_CODEC", "PRESETS",
+]
+
+MODE_CRF = 0
+MODE_BITRATE = 1
+
+# CRF guidance shown live as the slider moves.
+CRF_ADVICE = [
+    (0, "Lossless, very large files"),
+    (18, "Visually transparent"),
+    (24, "Good quality, balanced size"),
+    (30, "Noticeable loss, small files"),
+    (52, "Heavy loss"),
+]
 
 
-class ConversionOptionsDialog(QDialog):
-    def __init__(self, input_files, converter, parent=None, initial_options=None):
+def crf_advice(value: int) -> str:
+    for threshold, text in CRF_ADVICE:
+        if value <= threshold:
+            return lang.lang.get(text)
+    return ""
+
+
+class ConversionOptionsDialog(MessageBoxBase):
+    """Fluent options sheet: Quality / Video / Audio / Advanced."""
+
+    def __init__(self, input_files, converter, parent=None,
+                 initial_options=None, media_info=None, batch_count=1):
         super().__init__(parent)
-        self.input_files = input_files
+        self.input_files = list(input_files or [])
         self.converter = converter
-        self.media_info = get_media_info(input_files[0]) if input_files else {}
-        self.initial_options = initial_options or {}
-        self.setWindowTitle("Conversion Options")
-        self.resize(720, 600)
-        self.setModal(True)
-        self._build_ui()
-        self._populate_defaults()
-        self._apply_initial_options()
+        self.batch_count = max(1, int(batch_count))
+        self.media_info = media_info or {}
 
-    def _build_ui(self):
-        main_layout = QVBoxLayout(self)
+        if isinstance(initial_options, ConversionOptions):
+            self.initial = initial_options.copy()
+        else:
+            self.initial = ConversionOptions.from_mapping(initial_options or {})
 
-        # --- File info ---
-        info_widget = QWidget()
-        info_layout = QHBoxLayout(info_widget)
-        self.icon_label = QLabel()
-        self.icon_label.setFixedSize(64, 64)
-        self._set_file_icon()
-        info_layout.addWidget(self.icon_label)
+        self.target_extension = (converter.output_extension or "").lower()
+        # The *output* category decides which controls apply: an "extract audio"
+        # converter takes video in but must not offer video encoding options.
+        category = category_for_extension(self.target_extension)
+        self.has_video = category == "Video" and converter.category == "Video"
+        self.has_audio = category in ("Video", "Audio")
 
-        details_layout = QVBoxLayout()
-        self.file_name_label = QLabel(Path(self.input_files[0]).name)
-        self.file_name_label.setStyleSheet("font-weight: bold;")
-        details_layout.addWidget(self.file_name_label)
+        self._pages = {}
+        self._build()
+        self._load_initial()
 
-        size = os.path.getsize(self.input_files[0])
-        self.size_label = QLabel(f"Size: {self._format_size(size)}")
-        details_layout.addWidget(self.size_label)
+        self.yesButton.setText(lang.lang.get("Apply"))
+        self.cancelButton.setText(lang.lang.get("Cancel"))
+        self.widget.setMinimumWidth(600)
 
-        if self.media_info:
-            dur = self.media_info.get("duration", 0)
-            if dur:
-                self.duration_label = QLabel(f"Duration: {self._format_time(dur)}")
-                details_layout.addWidget(self.duration_label)
-            if "width" in self.media_info and "height" in self.media_info:
-                self.res_label = QLabel(f"Resolution: {self.media_info['width']}x{self.media_info['height']}")
-                details_layout.addWidget(self.res_label)
-        info_layout.addLayout(details_layout)
-        info_layout.addStretch()
-        main_layout.addWidget(info_widget)
+    # ------------------------------------------------------------- building --
+    def _build(self):
+        self.viewLayout.setSpacing(10)
 
-        # --- Tabs ---
-        self.tabs = QTabWidget()
+        self.title_label = SubtitleLabel(self._title_text(), self)
+        self.viewLayout.addWidget(self.title_label)
 
-        # General tab (preset, copy, trim, threads, delete source, shutdown)
-        general_tab = QWidget()
-        general_layout = QFormLayout(general_tab)
+        self.summary_label = CaptionLabel(self._summary_text(), self)
+        self.summary_label.setWordWrap(True)
+        self.viewLayout.addWidget(self.summary_label)
 
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(list(PRESETS.keys()))
-        general_layout.addRow("Preset", self.preset_combo)
+        self.pivot = Pivot(self)
+        self.stack = QStackedWidget(self)
+        self.stack.setMinimumHeight(250)
+        self.viewLayout.addWidget(self.pivot)
+        self.viewLayout.addWidget(self.stack)
 
-        self.copy_mode_check = QCheckBox("Copy streams (no re-encode, remux only)")
-        general_layout.addRow(self.copy_mode_check)
+        self._add_page("quality", lang.lang.get("Quality"), self._build_quality_page())
+        if self.has_video:
+            self._add_page("video", lang.lang.get("Video"), self._build_video_page())
+        if self.has_audio:
+            self._add_page("audio", lang.lang.get("Audio"), self._build_audio_page())
+        self._add_page("advanced", lang.lang.get("Advanced"), self._build_advanced_page())
 
-        self.copy_audio_check = QCheckBox("Copy audio (no re-encode)")
-        general_layout.addRow(self.copy_audio_check)
+        self.pivot.setCurrentItem("quality")
+        self.stack.setCurrentWidget(self._pages["quality"])
 
-        trim_layout = QHBoxLayout()
-        self.start_time_edit = QLineEdit()
-        self.start_time_edit.setPlaceholderText("Start (HH:MM:SS)")
-        self.end_time_edit = QLineEdit()
-        self.end_time_edit.setPlaceholderText("End (HH:MM:SS)")
-        trim_layout.addWidget(QLabel("From:"))
-        trim_layout.addWidget(self.start_time_edit)
-        trim_layout.addWidget(QLabel("To:"))
-        trim_layout.addWidget(self.end_time_edit)
-        general_layout.addRow("Trim", trim_layout)
+    def _add_page(self, key, title, widget):
+        self._pages[key] = widget
+        self.stack.addWidget(widget)
+        self.pivot.addItem(
+            routeKey=key, text=title,
+            onClick=lambda checked=False, target=widget: self.stack.setCurrentWidget(target),
+        )
 
-        self.thread_spin = QSpinBox()
+    def _title_text(self):
+        target = self.target_extension.upper().lstrip(".")
+        if self.batch_count > 1:
+            return (f"{lang.lang.get('Options for')} {self.batch_count} "
+                    f"{lang.lang.get('files')} \u2192 {target}")
+        return f"{lang.lang.get('Conversion options')} \u2192 {target}"
+
+    def _summary_text(self):
+        if self.batch_count > 1:
+            return lang.lang.get(
+                "These settings replace the options of every selected file in this category."
+            )
+        if not self.input_files:
+            return ""
+        path = Path(self.input_files[0])
+        parts = [path.name]
+        try:
+            parts.append(format_size(path.stat().st_size))
+        except OSError:
+            pass
+        if self.media_info.get("duration"):
+            parts.append(format_short_duration(self.media_info["duration"]))
+        if self.media_info.get("width") and self.media_info.get("height"):
+            parts.append(f"{self.media_info['width']}\u00d7{self.media_info['height']}")
+        return "  \u00b7  ".join(parts)
+    # ---------------------------------------------------------------- pages --
+    def _build_quality_page(self):
+        page = QWidget(self)
+        layout = QFormLayout(page)
+        layout.setSpacing(9)
+
+        self.preset_combo = ComboBox(page)
+        for name in PRESETS:
+            self.preset_combo.addItem(lang.lang.get(name), userData=name)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        layout.addRow(BodyLabel(lang.lang.get("Preset"), page), self.preset_combo)
+
+        self.preset_hint = CaptionLabel("", page)
+        self.preset_hint.setWordWrap(True)
+        layout.addRow("", self.preset_hint)
+
+        self.copy_mode_check = CheckBox(lang.lang.get("Remux only (no re-encoding)"), page)
+        self.copy_mode_check.setToolTip(lang.lang.get(
+            "Rewraps existing streams. Almost instant and lossless, but only "
+            "works when the target container supports them."
+        ))
+        self.copy_mode_check.installEventFilter(ToolTipFilter(self.copy_mode_check))
+        self.copy_mode_check.stateChanged.connect(self._on_copy_mode_changed)
+        layout.addRow(self.copy_mode_check)
+
+        trim_row = QHBoxLayout()
+        self.start_time_edit = LineEdit(page)
+        self.start_time_edit.setPlaceholderText("00:00:00")
+        self.end_time_edit = LineEdit(page)
+        self.end_time_edit.setPlaceholderText(lang.lang.get("end"))
+        trim_row.addWidget(self.start_time_edit)
+        trim_row.addWidget(BodyLabel("\u2192", page))
+        trim_row.addWidget(self.end_time_edit)
+        layout.addRow(BodyLabel(lang.lang.get("Trim"), page), trim_row)
+
+        self.thread_spin = SpinBox(page)
         self.thread_spin.setRange(0, 64)
-        self.thread_spin.setSpecialValueText("Auto")
-        general_layout.addRow("Threads", self.thread_spin)
+        self.thread_spin.setSpecialValueText(lang.lang.get("Auto"))
+        self.thread_spin.setToolTip(lang.lang.get("Threads per file. Auto lets ffmpeg decide."))
+        self.thread_spin.installEventFilter(ToolTipFilter(self.thread_spin))
+        layout.addRow(BodyLabel(lang.lang.get("Threads"), page), self.thread_spin)
 
-        self.delete_source_check = QCheckBox("Delete source after conversion")
-        general_layout.addRow(self.delete_source_check)
+        self.delete_source_check = CheckBox(
+            lang.lang.get("Delete the original after converting"), page
+        )
+        layout.addRow(self.delete_source_check)
+        return page
 
-        self.shutdown_check = QCheckBox("Shutdown computer after conversion")
-        general_layout.addRow(self.shutdown_check)
+    def _build_video_page(self):
+        page = QWidget(self)
+        layout = QFormLayout(page)
+        layout.setSpacing(9)
 
-        self.tabs.addTab(general_tab, "General")
+        self.video_codec_combo = ComboBox(page)
+        for key, label in VIDEO_CODECS.items():
+            self.video_codec_combo.addItem(label, userData=key)
+        layout.addRow(BodyLabel(lang.lang.get("Codec"), page), self.video_codec_combo)
 
-        # Video tab
-        if self.converter.category == "Video":
-            video_tab = QWidget()
-            video_layout = QVBoxLayout(video_tab)
+        self.quality_mode_combo = ComboBox(page)
+        self.quality_mode_combo.addItem(lang.lang.get("Constant quality (CRF)"), userData=MODE_CRF)
+        self.quality_mode_combo.addItem(lang.lang.get("Target bitrate"), userData=MODE_BITRATE)
+        self.quality_mode_combo.currentIndexChanged.connect(self._on_quality_mode_changed)
+        layout.addRow(BodyLabel(lang.lang.get("Quality mode"), page), self.quality_mode_combo)
 
-            # Video codec
-            codec_layout = QHBoxLayout()
-            codec_layout.addWidget(QLabel("Video Codec:"))
-            self.video_codec_combo = QComboBox()
-            self._populate_codec_combo(self.video_codec_combo, VIDEO_CODECS, self.converter.output_extension)
-            codec_layout.addWidget(self.video_codec_combo)
-            video_layout.addLayout(codec_layout)
+        crf_row = QHBoxLayout()
+        self.crf_slider = Slider(Qt.Horizontal, page)
+        self.crf_slider.setRange(0, 51)
+        self.crf_slider.setValue(23)
+        self.crf_value_label = BodyLabel("23", page)
+        self.crf_value_label.setFixedWidth(24)
+        self.crf_slider.valueChanged.connect(self._on_crf_changed)
+        crf_row.addWidget(self.crf_slider)
+        crf_row.addWidget(self.crf_value_label)
+        layout.addRow(BodyLabel(lang.lang.get("CRF"), page), crf_row)
 
-            # Quality (CRF / Bitrate)
-            quality_group = QGroupBox("Quality")
-            quality_layout = QFormLayout(quality_group)
-            self.quality_mode_combo = QComboBox()
-            self.quality_mode_combo.addItems(["CRF (Constant Rate Factor)", "Bitrate (kbps)"])
-            self.quality_mode_combo.currentIndexChanged.connect(self._on_quality_mode_changed)
-            quality_layout.addRow("Mode:", self.quality_mode_combo)
+        self.crf_hint = CaptionLabel("", page)
+        layout.addRow("", self.crf_hint)
 
-            self.crf_slider = QSlider(Qt.Horizontal)
-            self.crf_slider.setRange(0, 51)
-            self.crf_slider.setValue(23)
-            self.crf_slider.setTickInterval(5)
-            self.crf_slider.setTickPosition(QSlider.TicksBelow)
-            self.crf_label = QLabel("23")
-            self.crf_slider.valueChanged.connect(lambda v: self.crf_label.setText(str(v)))
-            crf_row = QHBoxLayout()
-            crf_row.addWidget(self.crf_slider)
-            crf_row.addWidget(self.crf_label)
-            quality_layout.addRow("CRF value:", crf_row)
+        self.video_bitrate_spin = SpinBox(page)
+        self.video_bitrate_spin.setRange(100, 100000)
+        self.video_bitrate_spin.setValue(2500)
+        self.video_bitrate_spin.setSuffix(" kbps")
+        layout.addRow(BodyLabel(lang.lang.get("Bitrate"), page), self.video_bitrate_spin)
 
-            self.bitrate_spin = QSpinBox()
-            self.bitrate_spin.setRange(100, 50000)
-            self.bitrate_spin.setValue(2000)
-            self.bitrate_spin.setSuffix(" kbps")
-            self.bitrate_spin.setEnabled(False)
-            quality_layout.addRow("Bitrate:", self.bitrate_spin)
-            video_layout.addWidget(quality_group)
+        self.resolution_combo = ComboBox(page)
+        for label, width, height in RESOLUTION_PRESETS:
+            self.resolution_combo.addItem(lang.lang.get(label), userData=(width, height))
+        self.resolution_combo.addItem(lang.lang.get("Custom"), userData="custom")
+        self.resolution_combo.currentIndexChanged.connect(self._on_resolution_changed)
+        layout.addRow(BodyLabel(lang.lang.get("Resolution"), page), self.resolution_combo)
 
-            # Scaling
-            scale_group = QGroupBox("Resolution")
-            scale_layout = QFormLayout(scale_group)
-            self.scale_preset_combo = QComboBox()
-            self.scale_preset_combo.addItems(["Original", "720p (1280x720)", "1080p (1920x1080)", "480p (854x480)", "Custom"])
-            self.scale_preset_combo.currentIndexChanged.connect(self._on_scale_preset_changed)
-            scale_layout.addRow("Preset:", self.scale_preset_combo)
+        size_row = QHBoxLayout()
+        self.width_spin = SpinBox(page)
+        self.width_spin.setRange(0, 7680)
+        self.height_spin = SpinBox(page)
+        self.height_spin.setRange(0, 4320)
+        size_row.addWidget(self.width_spin)
+        size_row.addWidget(BodyLabel("\u00d7", page))
+        size_row.addWidget(self.height_spin)
+        layout.addRow(BodyLabel(lang.lang.get("Custom size"), page), size_row)
+        return page
 
-            self.scale_width = QSpinBox()
-            self.scale_width.setRange(0, 7680)
-            self.scale_width.setValue(0)
-            self.scale_width.setEnabled(False)
-            self.scale_height = QSpinBox()
-            self.scale_height.setRange(0, 4320)
-            self.scale_height.setValue(0)
-            self.scale_height.setEnabled(False)
-            wh_layout = QHBoxLayout()
-            wh_layout.addWidget(QLabel("Width:"))
-            wh_layout.addWidget(self.scale_width)
-            wh_layout.addWidget(QLabel("Height:"))
-            wh_layout.addWidget(self.scale_height)
-            scale_layout.addRow("Custom size:", wh_layout)
-            video_layout.addWidget(scale_group)
+    def _build_audio_page(self):
+        page = QWidget(self)
+        layout = QFormLayout(page)
+        layout.setSpacing(9)
 
-            self.tabs.addTab(video_tab, "Video")
+        self.copy_audio_check = CheckBox(lang.lang.get("Keep the original audio track"), page)
+        self.copy_audio_check.stateChanged.connect(self._on_copy_audio_changed)
+        layout.addRow(self.copy_audio_check)
 
-        # Audio tab (if Video or Audio)
-        if self.converter.category in ("Video", "Audio"):
-            audio_tab = QWidget()
-            audio_layout = QVBoxLayout(audio_tab)
+        self.audio_codec_combo = ComboBox(page)
+        for key, label in AUDIO_CODECS.items():
+            self.audio_codec_combo.addItem(label, userData=key)
+        layout.addRow(BodyLabel(lang.lang.get("Codec"), page), self.audio_codec_combo)
 
-            codec_layout = QHBoxLayout()
-            codec_layout.addWidget(QLabel("Audio Codec:"))
-            self.audio_codec_combo = QComboBox()
-            self._populate_codec_combo(self.audio_codec_combo, AUDIO_CODECS, self.converter.output_extension)
-            codec_layout.addWidget(self.audio_codec_combo)
-            audio_layout.addLayout(codec_layout)
+        self.audio_bitrate_combo = ComboBox(page)
+        for value in AUDIO_BITRATE_CHOICES:
+            self.audio_bitrate_combo.addItem(f"{value} kbps", userData=value)
+        layout.addRow(BodyLabel(lang.lang.get("Bitrate"), page), self.audio_bitrate_combo)
 
-            bitrate_layout = QHBoxLayout()
-            bitrate_layout.addWidget(QLabel("Bitrate (kbps):"))
-            self.audio_bitrate_spin = QSpinBox()
-            self.audio_bitrate_spin.setRange(32, 512)
-            self.audio_bitrate_spin.setValue(128)
-            self.audio_bitrate_spin.setSuffix(" kbps")
-            bitrate_layout.addWidget(self.audio_bitrate_spin)
-            audio_layout.addLayout(bitrate_layout)
+        self.sample_rate_combo = ComboBox(page)
+        self.sample_rate_combo.addItem(lang.lang.get("Same as source"), userData=None)
+        for rate in AUDIO_SAMPLE_RATES:
+            self.sample_rate_combo.addItem(f"{int(rate) / 1000:.1f} kHz", userData=int(rate))
+        layout.addRow(BodyLabel(lang.lang.get("Sample rate"), page), self.sample_rate_combo)
 
-            sr_layout = QHBoxLayout()
-            sr_layout.addWidget(QLabel("Sample Rate (Hz):"))
-            self.sample_rate_combo = QComboBox()
-            self.sample_rate_combo.addItems(["44100", "48000", "96000", "192000"])
-            sr_layout.addWidget(self.sample_rate_combo)
-            audio_layout.addLayout(sr_layout)
+        self.lossless_hint = CaptionLabel("", page)
+        self.lossless_hint.setWordWrap(True)
+        layout.addRow("", self.lossless_hint)
+        return page
 
-            self.tabs.addTab(audio_tab, "Audio")
+    def _build_advanced_page(self):
+        page = QWidget(self)
+        layout = QFormLayout(page)
+        layout.setSpacing(9)
 
-        # Advanced (extra args)
-        extra_tab = QWidget()
-        extra_layout = QVBoxLayout(extra_tab)
-        self.extra_args_edit = QLineEdit()
-        self.extra_args_edit.setPlaceholderText("e.g. -preset slow -tune film")
-        extra_layout.addWidget(QLabel("Additional ffmpeg arguments:"))
-        extra_layout.addWidget(self.extra_args_edit)
-        self.tabs.addTab(extra_tab, "Advanced")
+        self.extra_args_edit = LineEdit(page)
+        self.extra_args_edit.setPlaceholderText("-tune film -movflags +faststart")
+        layout.addRow(BodyLabel(lang.lang.get("Extra ffmpeg arguments"), page),
+                      self.extra_args_edit)
 
-        main_layout.addWidget(self.tabs)
+        warning = CaptionLabel(lang.lang.get(
+            "Passed to ffmpeg verbatim. Invalid arguments will make the conversion fail."
+        ), page)
+        warning.setWordWrap(True)
+        layout.addRow("", warning)
 
-        # Buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        self.convert_btn = QPushButton("Convert")
-        self.convert_btn.clicked.connect(self.accept)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(self.convert_btn)
-        btn_layout.addWidget(self.cancel_btn)
-        main_layout.addLayout(btn_layout)
+        self.command_preview = CaptionLabel("", page)
+        self.command_preview.setWordWrap(True)
+        self.command_preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addRow(BodyLabel(lang.lang.get("Resulting arguments"), page),
+                      self.command_preview)
+        return page
+    # -------------------------------------------------------------- reactions --
+    def _on_preset_changed(self, _index):
+        name = self.preset_combo.currentData() or "None"
+        self.preset_hint.setText(lang.lang.get(PRESET_DESCRIPTIONS.get(name, "")))
+        self._update_command_preview()
 
-    def _set_file_icon(self):
-        ext = Path(self.input_files[0]).suffix.lower()
-        icon_map = {
-            ".mp4": "video.svg", ".mkv": "video.svg", ".mov": "video.svg", ".avi": "video.svg",
-            ".mp3": "audio.svg", ".wav": "audio.svg", ".flac": "audio.svg", ".aac": "audio.svg",
-            ".ogg": "audio.svg", ".m4a": "audio.svg",
-            ".jpg": "image.svg", ".jpeg": "image.svg", ".png": "image.svg",
-        }
-        icon_name = icon_map.get(ext, "file.svg")
-        icon_path = ICONS / icon_name
-        if icon_path.exists():
-            pixmap = QPixmap(str(icon_path))
-            if not pixmap.isNull():
-                self.icon_label.setPixmap(pixmap.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                return
-        self.icon_label.setText("📄")
+    def _on_copy_mode_changed(self, _state):
+        """Remuxing bypasses every encoder setting, so grey them all out."""
+        remux = self.copy_mode_check.isChecked()
+        for page_key in ("video", "audio"):
+            page = self._pages.get(page_key)
+            if page is not None:
+                page.setEnabled(not remux)
+        self.preset_combo.setEnabled(not remux)
+        self.preset_hint.setVisible(not remux)
+        self._update_command_preview()
 
-    def _format_size(self, size):
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024.0:
-                return f"{size:.1f} {unit}"
-            size /= 1024.0
-        return f"{size:.1f} TB"
+    def _on_copy_audio_changed(self, _state):
+        copying = self.copy_audio_check.isChecked()
+        for widget in (self.audio_codec_combo, self.audio_bitrate_combo,
+                       self.sample_rate_combo):
+            widget.setEnabled(not copying)
+        self._update_command_preview()
 
-    def _format_time(self, seconds):
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        if seconds < 3600:
-            m, s = divmod(seconds, 60)
-            return f"{int(m):02d}:{int(s):02d}"
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+    def _on_quality_mode_changed(self, _index):
+        crf_mode = self.quality_mode_combo.currentData() == MODE_CRF
+        self.crf_slider.setEnabled(crf_mode)
+        self.crf_value_label.setEnabled(crf_mode)
+        self.crf_hint.setVisible(crf_mode)
+        self.video_bitrate_spin.setEnabled(not crf_mode)
+        self._update_command_preview()
 
-    def _populate_codec_combo(self, combo, codec_dict, output_ext):
-        for key, display in codec_dict.items():
-            combo.addItem(display, key)
-        default_codec = None
-        if self.converter.category == "Video":
-            default_codec = DEFAULT_VIDEO_CODEC.get(output_ext)
-        elif self.converter.category == "Audio":
-            default_codec = DEFAULT_AUDIO_CODEC.get(output_ext)
-        if default_codec:
-            idx = combo.findData(default_codec)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
+    def _on_crf_changed(self, value):
+        self.crf_value_label.setText(str(value))
+        self.crf_hint.setText(crf_advice(value))
+        self._update_command_preview()
 
-    def _populate_defaults(self):
-        if self.media_info:
-            if "width" in self.media_info and hasattr(self, 'scale_width'):
-                self.scale_width.setValue(self.media_info["width"])
-                self.scale_height.setValue(self.media_info["height"])
+    def _on_resolution_changed(self, _index):
+        data = self.resolution_combo.currentData()
+        custom = data == "custom"
+        self.width_spin.setEnabled(custom)
+        self.height_spin.setEnabled(custom)
+        if not custom and isinstance(data, tuple):
+            width, height = data
+            self.width_spin.setValue(width)
+            self.height_spin.setValue(height)
+        self._update_command_preview()
 
-    def _apply_initial_options(self):
-        if not self.initial_options:
+    def _update_command_preview(self):
+        """Show the arguments this configuration produces.
+
+        Makes the effect of presets and overrides inspectable instead of opaque.
+        """
+        if not hasattr(self, "command_preview"):
             return
+        try:
+            args = self.get_options().build_extra_args()
+        except Exception:
+            self.command_preview.setText("")
+            return
+        self.command_preview.setText(" ".join(args) if args else lang.lang.get("None"))
 
-        preset = self.initial_options.get("preset")
-        if preset and preset in PRESETS:
-            idx = self.preset_combo.findText(preset)
-            if idx >= 0:
-                self.preset_combo.setCurrentIndex(idx)
+    # ------------------------------------------------------------ load state --
+    def _load_initial(self):
+        options = self.initial
 
-        self.copy_mode_check.setChecked(self.initial_options.get("copy_mode", False))
-        self.copy_audio_check.setChecked(self.initial_options.get("copy_audio", False))
-        self.start_time_edit.setText(self.initial_options.get("start_time") or "")
-        self.end_time_edit.setText(self.initial_options.get("end_time") or "")
-        self.thread_spin.setValue(self.initial_options.get("threads", 0))
-        self.delete_source_check.setChecked(self.initial_options.get("delete_source", False))
-        self.shutdown_check.setChecked(self.initial_options.get("shutdown", False))
+        index = self.preset_combo.findData(options.preset or "None")
+        self.preset_combo.setCurrentIndex(max(0, index))
+        self._on_preset_changed(0)
 
-        if self.converter.category == "Video":
-            codec = self.initial_options.get("video_codec")
-            if codec:
-                idx = self.video_codec_combo.findData(codec)
-                if idx >= 0:
-                    self.video_codec_combo.setCurrentIndex(idx)
+        self.copy_mode_check.setChecked(options.copy_mode)
+        self.start_time_edit.setText(options.start_time or "")
+        self.end_time_edit.setText(options.end_time or "")
+        self.thread_spin.setValue(options.threads or 0)
+        self.delete_source_check.setChecked(options.delete_source)
 
-            if "crf" in self.initial_options:
-                self.quality_mode_combo.setCurrentIndex(0)
-                self.crf_slider.setValue(int(self.initial_options["crf"]))
-            elif "video_bitrate" in self.initial_options:
-                self.quality_mode_combo.setCurrentIndex(1)
-                self.bitrate_spin.setValue(int(self.initial_options["video_bitrate"]))
+        if self.has_video:
+            self._load_video(options)
+        if self.has_audio:
+            self._load_audio(options)
 
-            scale = self.initial_options.get("scale")
-            if scale:
-                try:
-                    w, h = map(int, scale.split(":", 1))
-                    self.scale_preset_combo.setCurrentIndex(4)
-                    self.scale_width.setValue(w)
-                    self.scale_height.setValue(h)
-                    self.scale_width.setEnabled(True)
-                    self.scale_height.setEnabled(True)
-                except Exception:
-                    pass
+        self.extra_args_edit.setText(" ".join(options.extra_args or []))
 
-        if self.converter.category in ("Video", "Audio"):
-            codec = self.initial_options.get("audio_codec")
-            if codec:
-                idx = self.audio_codec_combo.findData(codec)
-                if idx >= 0:
-                    self.audio_codec_combo.setCurrentIndex(idx)
-            self.audio_bitrate_spin.setValue(int(self.initial_options.get("audio_bitrate", self.audio_bitrate_spin.value())))
-            sample_rate = self.initial_options.get("sample_rate")
-            if sample_rate:
-                idx = self.sample_rate_combo.findText(str(sample_rate))
-                if idx >= 0:
-                    self.sample_rate_combo.setCurrentIndex(idx)
+        # Apply dependent enable/disable states after everything is populated.
+        self._on_copy_mode_changed(0)
+        self._update_command_preview()
 
-        extra_args = self.initial_options.get("extra_args") or []
-        if extra_args:
-            self.extra_args_edit.setText(" ".join(extra_args))
+    def _load_video(self, options):
+        codec = options.video_codec or DEFAULT_VIDEO_CODEC.get(self.target_extension)
+        if codec:
+            index = self.video_codec_combo.findData(codec)
+            if index >= 0:
+                self.video_codec_combo.setCurrentIndex(index)
 
-    def _on_quality_mode_changed(self, index):
-        is_crf = (index == 0)
-        self.crf_slider.setEnabled(is_crf)
-        self.crf_label.setEnabled(is_crf)
-        self.bitrate_spin.setEnabled(not is_crf)
-
-    def _on_scale_preset_changed(self, index):
-        presets = {
-            1: (1280, 720),
-            2: (1920, 1080),
-            3: (854, 480),
-        }
-        if index in presets:
-            w, h = presets[index]
-            self.scale_width.setValue(w)
-            self.scale_height.setValue(h)
-            self.scale_width.setEnabled(False)
-            self.scale_height.setEnabled(False)
-        elif index == 4:
-            self.scale_width.setEnabled(True)
-            self.scale_height.setEnabled(True)
+        if options.video_bitrate is not None:
+            self.quality_mode_combo.setCurrentIndex(
+                self.quality_mode_combo.findData(MODE_BITRATE)
+            )
+            self.video_bitrate_spin.setValue(int(options.video_bitrate))
         else:
-            self.scale_width.setValue(0)
-            self.scale_height.setValue(0)
-            self.scale_width.setEnabled(False)
-            self.scale_height.setEnabled(False)
+            self.quality_mode_combo.setCurrentIndex(
+                self.quality_mode_combo.findData(MODE_CRF)
+            )
+            self.crf_slider.setValue(int(options.crf) if options.crf is not None else 23)
 
-    def get_options(self):
-        opts = {}
+        source_width = int(self.media_info.get("width") or 0)
+        source_height = int(self.media_info.get("height") or 0)
 
-        opts["preset"] = self.preset_combo.currentText()
-        opts["copy_mode"] = self.copy_mode_check.isChecked()
-        opts["copy_audio"] = self.copy_audio_check.isChecked()
-        opts["start_time"] = self.start_time_edit.text().strip() or None
-        opts["end_time"] = self.end_time_edit.text().strip() or None
-        opts["threads"] = self.thread_spin.value()
-        opts["delete_source"] = self.delete_source_check.isChecked()
-        opts["shutdown"] = self.shutdown_check.isChecked()
-
-        if self.converter.category == "Video":
-            opts["video_codec"] = self.video_codec_combo.currentData()
-            mode = self.quality_mode_combo.currentIndex()
-            if mode == 0:
-                opts["crf"] = self.crf_slider.value()
-            else:
-                opts["video_bitrate"] = self.bitrate_spin.value()
-            if self.scale_preset_combo.currentIndex() == 0:
-                opts["scale"] = None
-            else:
-                w = self.scale_width.value()
-                h = self.scale_height.value()
-                opts["scale"] = f"{w}:{h}" if w > 0 and h > 0 else None
-
-        if self.converter.category in ("Video", "Audio"):
-            opts["audio_codec"] = self.audio_codec_combo.currentData()
-            opts["audio_bitrate"] = self.audio_bitrate_spin.value()
-            opts["sample_rate"] = int(self.sample_rate_combo.currentText())
-
-        extra = self.extra_args_edit.text().strip()
-        if extra:
-            opts["extra_args"] = extra.split()
+        if options.scale:
+            try:
+                width, height = (int(part) for part in options.scale.split(":", 1))
+                matched = self.resolution_combo.findData((width, height))
+                if matched >= 0:
+                    self.resolution_combo.setCurrentIndex(matched)
+                else:
+                    self.resolution_combo.setCurrentIndex(self.resolution_combo.count() - 1)
+                self.width_spin.setValue(width)
+                self.height_spin.setValue(height)
+            except (TypeError, ValueError):
+                self.resolution_combo.setCurrentIndex(0)
         else:
-            opts["extra_args"] = []
+            self.resolution_combo.setCurrentIndex(0)
+            # Seed the custom fields with the real dimensions so switching to
+            # Custom starts from the source rather than zero.
+            self.width_spin.setValue(source_width)
+            self.height_spin.setValue(source_height)
 
-        return opts
+        self._on_quality_mode_changed(0)
+        self._on_crf_changed(self.crf_slider.value())
+        self._on_resolution_changed(0)
+
+    def _load_audio(self, options):
+        self.copy_audio_check.setChecked(options.copy_audio)
+
+        codec = options.audio_codec or DEFAULT_AUDIO_CODEC.get(self.target_extension)
+        if codec:
+            index = self.audio_codec_combo.findData(codec)
+            if index >= 0:
+                self.audio_codec_combo.setCurrentIndex(index)
+
+        bitrate = options.audio_bitrate or 192
+        index = self.audio_bitrate_combo.findData(int(bitrate))
+        if index < 0:
+            # Nearest supported choice, so an odd stored value still shows sensibly.
+            nearest = min(AUDIO_BITRATE_CHOICES, key=lambda value: abs(value - int(bitrate)))
+            index = self.audio_bitrate_combo.findData(nearest)
+        self.audio_bitrate_combo.setCurrentIndex(max(0, index))
+
+        if options.sample_rate:
+            index = self.sample_rate_combo.findData(int(options.sample_rate))
+            self.sample_rate_combo.setCurrentIndex(max(0, index))
+        else:
+            self.sample_rate_combo.setCurrentIndex(0)
+
+        # Bitrate is meaningless for lossless codecs; say so rather than lie.
+        lossless = self.target_extension in (".flac", ".wav")
+        self.audio_bitrate_combo.setEnabled(not lossless)
+        self.lossless_hint.setText(
+            lang.lang.get("This format is lossless, so the bitrate setting is ignored.")
+            if lossless else ""
+        )
+        self._on_copy_audio_changed(0)
+
+    # ----------------------------------------------------------- read state --
+    def get_options(self) -> ConversionOptions:
+        options = ConversionOptions(
+            preset=self.preset_combo.currentData() or "None",
+            copy_mode=self.copy_mode_check.isChecked(),
+            start_time=self.start_time_edit.text().strip() or None,
+            end_time=self.end_time_edit.text().strip() or None,
+            threads=self.thread_spin.value(),
+            delete_source=self.delete_source_check.isChecked(),
+            extra_args=self.extra_args_edit.text().split() if self.extra_args_edit.text().strip() else [],
+        )
+
+        if self.has_video and not options.copy_mode:
+            options.video_codec = self.video_codec_combo.currentData()
+            if self.quality_mode_combo.currentData() == MODE_CRF:
+                options.crf = self.crf_slider.value()
+            else:
+                options.video_bitrate = self.video_bitrate_spin.value()
+
+            data = self.resolution_combo.currentData()
+            width = height = 0
+            if data == "custom":
+                width, height = self.width_spin.value(), self.height_spin.value()
+            elif isinstance(data, tuple):
+                width, height = data
+            # 0x0 means "Original": emit no scale filter at all.
+            options.scale = f"{width}:{height}" if width > 0 and height > 0 else None
+
+        if self.has_audio and not options.copy_mode:
+            options.copy_audio = self.copy_audio_check.isChecked()
+            if not options.copy_audio:
+                options.audio_codec = self.audio_codec_combo.currentData()
+                if self.audio_bitrate_combo.isEnabled():
+                    options.audio_bitrate = self.audio_bitrate_combo.currentData()
+                options.sample_rate = self.sample_rate_combo.currentData()
+
+        return options
+

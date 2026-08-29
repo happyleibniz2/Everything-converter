@@ -6,6 +6,10 @@ from converters.base import Converter
 from utils.paths import FFMPEG
 import sys,time
 
+# Without this every parallel ffmpeg spawn flashes a console window on Windows.
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
 class FFmpegConverter(Converter):
     category = "Video"
 
@@ -98,7 +102,8 @@ class FFmpegConverter(Converter):
             raise FileNotFoundError(f"Bundled FFmpeg executable not found at {FFMPEG}")
         command = self._build_command(input_file, output_file)
         logger.debug("FFmpeg command: %s", " ".join(command))
-        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
+                                errors='replace', creationflags=CREATE_NO_WINDOW)
         if result.returncode != 0:
             error_msg = result.stderr.strip() or "FFmpeg conversion failed"
             logger.critical("FFmpeg stderr: %s", error_msg)
@@ -122,7 +127,7 @@ class FFmpegConverter(Converter):
                     "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1", input_file],
                     capture_output=True, text=True, timeout=10,
-                    encoding='utf-8', errors='ignore'
+                    encoding='utf-8', errors='ignore', creationflags=CREATE_NO_WINDOW
                 )
                 if probe.returncode == 0:
                     duration = float(probe.stdout.strip())
@@ -142,7 +147,8 @@ class FFmpegConverter(Converter):
             text=True,
             bufsize=1,
             encoding='utf-8',
-            errors='replace'
+            errors='replace',
+            creationflags=CREATE_NO_WINDOW
         )
         if process_callback:
             process_callback(proc)

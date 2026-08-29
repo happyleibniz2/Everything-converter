@@ -1,88 +1,192 @@
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QIcon, QPixmap, QPainter
-from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout
+"""The drag-and-drop target.
+
+Custom-painted rather than stylesheet-driven so it can render a dashed border,
+react to theme changes, and animate on drag-hover — none of which QSS does well.
+"""
+
+from PySide6.QtCore import (
+    Property, QEasingCurve, QPropertyAnimation, QRectF, Qt, Signal
+)
+from PySide6.QtGui import QColor, QCursor, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout
+
+from qfluentwidgets import (
+    BodyLabel, CaptionLabel, FluentIcon, IconWidget, StrongBodyLabel,
+    isDarkTheme, themeColor,
+)
 
 import lang
-from utils.paths import ICONS
+
+CATEGORY_ICONS = {
+    "Image": FluentIcon.PHOTO,
+    "Video": FluentIcon.VIDEO,
+    "Audio": FluentIcon.MUSIC,
+    "PDF": FluentIcon.DOCUMENT,
+    "Archives": FluentIcon.ZIP_FOLDER,
+    "Office": FluentIcon.DOCUMENT,
+    "Favorites": FluentIcon.HEART,
+}
 
 
 class DropArea(QFrame):
+    """Accepts dropped files and clicks to browse."""
+
     files_dropped = Signal(list)
     browse_requested = Signal()
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None, compact: bool = False):
+        super().__init__(parent)
         self.setAcceptDrops(True)
         self.setObjectName("dropArea")
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(12)
+        self._compact = compact
+        self._hovering = False
+        self._drag_active = False
+        self._glow = 0.0
 
-        self.icon_label = QLabel()
-        self.icon_label.setAlignment(Qt.AlignCenter)
-        self.icon_label.setObjectName("dropIcon")
-        self.set_icon(None)
+        self._glow_animation = QPropertyAnimation(self, b"glow", self)
+        self._glow_animation.setDuration(180)
+        self._glow_animation.setEasingCurve(QEasingCurve.OutCubic)
 
-        self.title_label = QLabel(lang.lang.get("Drop files here"))
+        self._build_ui()
+        self._apply_mode()
+
+    # ---------- construction ----------
+    def _build_ui(self):
+        self._layout = QVBoxLayout(self)
+        self._layout.setAlignment(Qt.AlignCenter)
+
+        self.icon_widget = IconWidget(FluentIcon.CLOUD, self)
+
+        self.title_label = StrongBodyLabel(lang.lang.get("Drop files here"), self)
         self.title_label.setAlignment(Qt.AlignCenter)
         self.title_label.setObjectName("dropTitle")
 
-        or_label = QLabel(lang.lang.get("or"))
-        or_label.setAlignment(Qt.AlignCenter)
+        self.hint_label = CaptionLabel(lang.lang.get("or click to browse your computer"), self)
+        self.hint_label.setAlignment(Qt.AlignCenter)
+        self.hint_label.setObjectName("browseLabel")
 
-        self.browse_label = QLabel(lang.lang.get("Click to browse"))
-        self.browse_label.setAlignment(Qt.AlignCenter)
-        self.browse_label.setObjectName("browseLabel")
+        self._row = QHBoxLayout()
+        self._row.setAlignment(Qt.AlignCenter)
 
-        layout.addWidget(self.icon_label)
-        layout.addWidget(self.title_label)
-        layout.addWidget(or_label)
-        layout.addWidget(self.browse_label)
+        self._layout.addWidget(self.icon_widget, 0, Qt.AlignCenter)
+        self._layout.addWidget(self.title_label)
+        self._layout.addWidget(self.hint_label)
+        self._layout.addLayout(self._row)
+
+    def _apply_mode(self):
+        """Tall hero layout when the queue is empty; a slim bar once it has items."""
+        if self._compact:
+            self.setMinimumHeight(64)
+            self.setMaximumHeight(72)
+            self._layout.setContentsMargins(20, 10, 20, 10)
+            self._layout.setSpacing(2)
+            self.icon_widget.setFixedSize(22, 22)
+            self.hint_label.setVisible(False)
+        else:
+            self.setMinimumHeight(190)
+            self.setMaximumHeight(16777215)
+            self._layout.setContentsMargins(24, 30, 24, 30)
+            self._layout.setSpacing(10)
+            self.icon_widget.setFixedSize(46, 46)
+            self.hint_label.setVisible(True)
+        self.updateGeometry()
+
+    def set_compact(self, compact: bool):
+        if compact == self._compact:
+            return
+        self._compact = compact
+        self._apply_mode()
+        self.retranslate()
 
     def set_icon(self, category):
-        icon_map = {
-            "Image": "image.svg",
-            "Video": "video.svg",
-            "Audio": "audio.svg",
-            "PDF": "pdf.svg",
-            "Archives": "archive.svg",
-            "Office": "office.svg",
-            "Favorites": "favorite.svg",
-        }
-        if category and category in icon_map:
-            icon_name = icon_map[category]
-        else:
-            icon_name = "image.svg"
+        self.icon_widget.setIcon(CATEGORY_ICONS.get(category, FluentIcon.CLOUD))
 
-        icon_path = ICONS / icon_name
-        if icon_path.exists():
-            renderer = QSvgRenderer(str(icon_path))
-            if renderer.isValid():
-                pixmap = QPixmap(64, 64)
-                pixmap.fill(Qt.transparent)
-                painter = QPainter(pixmap)
-                renderer.render(painter)
-                painter.end()
-                self.icon_label.setPixmap(pixmap)
-                return
+    # ---------- glow animation ----------
+    def get_glow(self) -> float:
+        return self._glow
 
-        icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
-        if not icon.isNull():
-            self.icon_label.setPixmap(icon.pixmap(64, 64))
+    def set_glow(self, value: float):
+        self._glow = value
+        self.update()
+
+    glow = Property(float, get_glow, set_glow)
+
+    def _animate_glow(self, target: float):
+        self._glow_animation.stop()
+        self._glow_animation.setStartValue(self._glow)
+        self._glow_animation.setEndValue(target)
+        self._glow_animation.start()
+
+    # ---------- painting ----------
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.Antialiasing)
+
+        dark = isDarkTheme()
+        accent = themeColor()
+        radius = 10.0
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+
+        # Background: tint toward the accent colour as the glow rises.
+        base = QColor(255, 255, 255, 10) if dark else QColor(255, 255, 255, 160)
+        if self._glow > 0:
+            tint = QColor(accent)
+            tint.setAlpha(int(28 * self._glow) + (6 if dark else 12))
+            painter.setBrush(tint)
         else:
-            self.icon_label.clear()
+            painter.setBrush(base)
+
+        border = QColor(accent) if self._glow > 0 else (
+            QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 40)
+        )
+        if self._glow > 0:
+            border.setAlpha(120 + int(135 * self._glow))
+
+        pen = QPen(border, 1.6 + 0.8 * self._glow, Qt.DashLine)
+        pen.setDashPattern([5, 4])
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+    # ---------- interaction ----------
+    def enterEvent(self, event):
+        self._hovering = True
+        if not self._drag_active:
+            self._animate_glow(0.35)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovering = False
+        if not self._drag_active:
+            self._animate_glow(0.0)
+        super().leaveEvent(event)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
+            self._drag_active = True
+            self._animate_glow(1.0)
+            self.title_label.setText(lang.lang.get("Release to add these files"))
             event.acceptProposedAction()
         else:
             event.ignore()
 
+    def dragLeaveEvent(self, event):
+        self._drag_active = False
+        self._animate_glow(0.35 if self._hovering else 0.0)
+        self.retranslate()
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event):
+        self._drag_active = False
+        self._animate_glow(0.0)
+        self.retranslate()
+
         files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
         if files:
             self.files_dropped.emit(files)
@@ -90,15 +194,15 @@ class DropArea(QFrame):
         else:
             event.ignore()
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+    def mouseReleaseEvent(self, event):
+        # Release rather than press, so a drag that starts here is not a click.
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
             self.browse_requested.emit()
-        super().mousePressEvent(event)
+        super().mouseReleaseEvent(event)
 
     def retranslate(self):
-        self.title_label.setText(lang.lang.get("Drop files here"))
-        self.browse_label.setText(lang.lang.get("Click to browse"))
-        # "or" label is not stored as attribute, find it
-        for child in self.children():
-            if isinstance(child, QLabel) and child.objectName() not in ("dropTitle", "browseLabel", "dropIcon"):
-                child.setText(lang.lang.get("or"))
+        if self._compact:
+            self.title_label.setText(lang.lang.get("Drop more files here, or click to browse"))
+        else:
+            self.title_label.setText(lang.lang.get("Drop files here"))
+        self.hint_label.setText(lang.lang.get("or click to browse your computer"))

@@ -1,7 +1,12 @@
 import json
 import subprocess
+import sys
 from typing import Dict, Any
 from utils.paths import FFPROBE
+
+# Suppress the console window ffprobe would otherwise flash on Windows.
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 
 def get_media_info(file_path: str) -> Dict[str, Any]:
     if not FFPROBE.exists():
@@ -15,7 +20,9 @@ def get_media_info(file_path: str) -> Dict[str, Any]:
             "-show_streams",
             file_path
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                                encoding="utf-8", errors="replace",
+                                creationflags=_CREATE_NO_WINDOW)
         if result.returncode != 0:
             return {}
         data = json.loads(result.stdout)

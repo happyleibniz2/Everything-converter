@@ -4,7 +4,7 @@
 **Stop juggling multiple tools.** Everything Converter is a powerful, free, and open‑source desktop application that handles all your image, video, and audio conversion needs in one clean interface. Drag, drop, convert — it’s that simple.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen)
+![Python](https://img.shields.io/badge/Python-3.12%2B-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![Status](https://img.shields.io/badge/status-beta-yellow)
 
@@ -13,14 +13,15 @@
 ## Why Everything Converter?
 
 - **One Tool for Everything** – From PNG to JPG, MP4 to MKV, MP3 to FLAC, and more. No need for separate apps.
-- **Batch Processing** – Convert hundreds of files at once, each with its own target format.
-- **Drag & Drop Simplicity** – Just drop your files and go. No complicated settings unless you want them.
-- **Advanced Options When You Need Them** – Fine‑tune video codecs, quality, scaling, trimming, and audio settings per file.
-- **Real‑time Progress** – See speed, time remaining, and per‑file progress as your conversions run.
-- **Pause & Resume** – Control conversions at your own pace.
-- **Error Assistant** – Get helpful suggestions when something goes wrong.
-- **Dark & Light Themes** – Work comfortably day or night.
-- **Multi‑language** – English, 中文, 日本語 – more coming.
+- **Parallel Batch Conversion** – Convert several files simultaneously, not one after another. Set one output format for the whole queue, or give each file its own.
+- **Batch Options** – Edit encoding settings once and apply them to every selected file.
+- **Drag & Drop Simplicity** – Drop files or whole folders and go.
+- **Advanced Options When You Need Them** – Fine‑tune codecs, CRF/bitrate, resolution, trimming, and audio per file.
+- **Live Progress** – Inline per‑file progress bars plus aggregate throughput, ETA and completion counts.
+- **Pause, Resume, Cancel & Retry** – Pause the whole batch, cancel a single file, or retry only what failed.
+- **Error Assistant** – Actionable diagnoses instead of raw FFmpeg output.
+- **Fluent Design UI** – Mica translucency, light/dark/auto themes and a custom accent colour.
+- **Multi‑language** – English, 中文, 日本語 – auto‑detected from your system.
 - **Completely Free & Open Source** – MIT licensed, no hidden costs.
 
 ---
@@ -35,26 +36,25 @@
 
 ---
 
-## Free Forever – With Optional Premium Add‑ons
+## Free and Open Source
 
-Everything Converter is **free and open‑source** (MIT license). The core conversion engine, drag‑and‑drop interface, batch processing, and all existing features will remain free forever.
+Everything Converter is **free and open‑source** under the MIT license, with no feature gates,
+no upsells, and no limit on how many files you convert in parallel.
 
-For users who need extra performance and support, we offer a **Premium tier** that helps fund ongoing development:
+Possible future directions (contributions welcome):
 
-| Premium Feature | Description |
-|-----------------|-------------|
-| 🚀 **GPU Acceleration** | NVENC, AMD AMF, Intel QSV support – convert videos 3‑10x faster by leveraging your graphics card. |
-| 🔁 **Unlimited Batch** | No limit on simultaneous conversions. Convert as many files in parallel as your hardware can handle. |
-| 📧 **Priority Support** | Faster responses via email – get help when you need it most. |
-
-These premium options will never lock basic functionality – you’ll always be able to convert your files without paying a cent.
+| Idea | Notes |
+|------|-------|
+| 🚀 **GPU Acceleration** | NVENC / AMD AMF / Intel QSV encoders for much faster video conversion. |
+| 📄 **PDF, Office & Archives** | The category stubs exist in `converters/`; the backends are not written yet. |
+| 💾 **Queue Persistence** | Restore an unfinished queue after a restart. |
 
 ---
 
 ## Quick Start
 
 ### Prerequisites
-- Python 3.10+ (if running from source)
+- Python 3.12+ (if running from source)
 - FFmpeg (bundled, but you can also provide your own)
 
 ### Installation
@@ -93,39 +93,48 @@ pyinstaller --onefile --windowed --add-data "resources;resources" --add-data "ff
 
 ## How It Works
 
-1. **Add Files** – Drag & drop or click to browse.
-2. **Choose Output** – Each file gets a dropdown with all compatible formats.
-3. **Tweak Options** (optional) – Click the gear icon to set codec, quality, trim, scale, and more per file.
-4. **Convert** – Hit the big Convert button and watch the magic happen.
-5. **Done** – Open the output folder or open converted files directly.
+1. **Add Files** – Drag & drop files or a whole folder, or use **Add ▸ Add files / Add folder**.
+2. **Choose Output** – Pick a format per row, or set **Convert all to:** once for the entire queue.
+3. **Tweak Options** (optional) – The gear icon edits one file; **Options for all…** edits every selected file at once.
+4. **Convert** – Watch inline per‑file progress plus overall throughput and ETA.
+5. **Done** – Open the output folder, or hit **Retry failed** if anything went wrong.
 
-It's that simple.
+Untick a row's checkbox to leave it out of the run without removing it from the queue.
 
 ---
 
 ## In‑Depth Features
 
+### Batch Conversion
+- **Parallel execution** – Several files encode at once. Set **Files at once** in Settings, or leave it on Auto to use half your CPU cores.
+- **Convert all to** – Retarget every compatible file in one action; files that cannot reach that format are reported and left alone.
+- **Options for all** – Edit one options sheet and apply it across a whole media category.
+- **Per‑file selection** – Checkboxes control what runs; the Convert button reflects the count.
+- **Filter, remove selected, clear finished, retry failed** – Manage large queues without starting over.
+
 ### Per‑File Customization
-Not all files are the same. You can set different conversion parameters for each file:
-- Video codec (H.264, HEVC, VP9, etc.)
-- Audio codec and bitrate
-- CRF or target bitrate
-- Scale/resize
-- Trim (start/end time)
-- Copy streams (no re‑encode)
-- Extra FFmpeg arguments
+- Video codec (H.264, HEVC, VP8/VP9, MPEG‑4, WMV, Xvid)
+- CRF (with live quality guidance) or target bitrate
+- Resolution presets up to 2160p, or custom dimensions
+- Audio codec, bitrate and sample rate
+- Trim (start/end)
+- Remux only – rewrap streams with no re‑encoding
+- Extra FFmpeg arguments, with a live preview of the resulting flags
 
 ### Smart Estimation
-Before converting, see estimated output size and space saved – so you know what to expect.
+Estimated output size per file and for the whole batch, accounting for codec efficiency, CRF, downscaling and trimming. Hover any estimate for a confidence rating.
+
+### Safe Output Handling
+Conversions are written to a temp file and moved into place on success, so a failure or cancellation never leaves a half‑written file. Naming collisions are resolved across the entire batch, and Overwrite will never destroy a source file.
 
 ### Error Assistant
-When a conversion fails, you get actionable suggestions instead of cryptic errors. No more googling.
+Failures are matched against common FFmpeg problems — missing encoders, permission errors, container/codec mismatches, odd dimensions, out‑of‑memory — and presented with concrete fixes alongside the raw output.
 
 ### System Tray & Notifications
-Minimize to tray and get notified when your batch finishes – ideal for long conversions.
+Get notified when a batch finishes while the window is in the background.
 
 ### Persistent Settings
-Your preferences (theme, language, output folder, default preset) are saved automatically.
+Theme, accent colour, language, output rules, parallelism and default preset are saved as you change them — no OK button.
 
 ---
 
@@ -144,29 +153,50 @@ Everything-converter/
 │   ├── image_converter.py  # Pillow
 │   ├── video_converter.py  # FFmpeg presets
 │   ├── ffmpeg_base.py      # FFmpeg wrapper
+│   ├── presets.py          # Codec tables, quality presets (no Qt imports)
 │   └── extensions.py       # Format descriptions
-├── ui/                     # PySide6 GUI
-│   ├── main_window.py
-│   ├── drop_area.py
+├── models/                 # Domain types
+│   ├── conversion_job.py   # A queued file + JobStatus lifecycle
+│   └── conversion_options.py  # User settings -> ffmpeg arguments
+├── services/               # Qt-light logic
+│   ├── batch_planner.py    # Eligible jobs, outputs, concurrency
+│   ├── output_planner.py   # Overwrite policy + batch collision safety
+│   ├── converter_factory.py   # Options -> configured converter
+│   ├── preview_service.py  # Off-thread ffprobe + thumbnails
+│   └── size_estimator.py   # Output size heuristics
+├── controllers/
+│   └── queue_controller.py # The queue; jobs addressed by id, not row
+├── workers/
+│   └── conversion_worker.py   # ConversionCoordinator over a thread pool
+├── ui/
+│   ├── main_window.py      # FluentWindow shell + navigation
+│   ├── interfaces/         # Convert / Formats / Settings pages
+│   ├── widgets/            # drop_area, queue_table, batch_bar,
+│   │                       #   progress_dock, empty_state
 │   ├── options_dialog.py
-│   ├── settings_dialog.py
-│   ├── about_dialog.py
 │   └── error_assistant.py
-├── utils/                  # Helpers
-│   ├── paths.py
-│   ├── media_info.py
-│   ├── output_builder.py
-│   ├── formatter.py
-│   └── size_estimator.py
-├── workers/                # QThread workers
-│   └── conversion_worker.py
-├── controllers/            # Business logic
-│   └── queue_controller.py
-├── models/                 # Data classes
+├── utils/                  # paths, media_info, formatter, output_builder
 ├── resources/              # Icons, translations, backgrounds
 ├── ffmpeg/                 # Bundled FFmpeg
 └── logs/                   # Runtime logs
 ```
+
+### Architecture Notes
+
+- **The queue is the single source of truth.** `QueueController` owns a list of
+  `ConversionJob`s; the table renders them and the worker consumes them. Jobs are
+  addressed by a stable `job_id`, never a row index, so sorting or removing rows
+  cannot misattribute options or results.
+- **Conversion runs on a thread pool.** `ConversionCoordinator` dispatches one
+  runnable per file onto a `QThreadPool` and owns all aggregate bookkeeping.
+  Batch progress is weighted by file size, so a 4 GB video and a 20 kB PNG are
+  not each "half the batch".
+- **Options own their own translation to ffmpeg.** `ConversionOptions.build_extra_args()`
+  is the only place user intent becomes command-line flags, which keeps the UI
+  out of the business of assembling ffmpeg invocations.
+- **Output naming is batch-aware.** `OutputPathPlanner` reserves each path as it
+  hands it out, so two queued files that resolve to the same name cannot
+  overwrite one another.
 
 ---
 
@@ -174,13 +204,15 @@ Everything-converter/
 
 | Component | Technology |
 |-----------|------------|
-| GUI | PySide6 (Qt) |
+| GUI | PySide6 (Qt 6) |
+| Design system | PySide6‑Fluent‑Widgets (WinUI 3 style) |
 | Images | Pillow |
-| Video/Audio | FFmpeg |
-| Metadata | FFprobe |
-| Concurrency | QThread |
+| Video/Audio | FFmpeg (bundled) |
+| Metadata & thumbnails | FFprobe / FFmpeg / Pillow |
+| Concurrency | QThreadPool + QRunnable |
+| Process control | psutil (pause / resume / cancel) |
 | Settings | QSettings |
-| i18n | JSON |
+| i18n | JSON dictionaries |
 | Packaging | PyInstaller / Nuitka |
 
 ---
@@ -231,4 +263,5 @@ MIT License – see the [LICENSE](LICENSE) file for details.
 
 - **Issues**: [GitHub Issues](https://github.com/happyleibniz2/Everything-converter/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/happyleibniz2/Everything-converter/discussions)
+
 

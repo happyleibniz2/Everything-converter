@@ -1,270 +1,419 @@
+"""Runs conversions concurrently and reports progress per job and in aggregate.
+
+Design notes
+------------
+The previous implementation nested a ``QThread`` inside another ``QThread`` and
+called ``wait()``, which forced everything to run strictly one file at a time.
+Here a :class:`ConversionCoordinator` lives on the GUI thread and dispatches
+:class:`_ConversionTask` runnables onto a ``QThreadPool``, so N files convert at
+once. The coordinator owns all aggregate bookkeeping (progress, speed, ETA) and
+is the only object the UI talks to.
+
+Progress is weighted by input file size rather than file count: converting a
+4 GB movie and a 20 kB PNG should not each be "50% of the batch".
+"""
+
 import os
 import shutil
 import signal
+import threading
 import time
 from pathlib import Path
+from typing import Dict, List
 
 import psutil
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
-import lang
 from logger import logger
+from models.conversion_job import ConversionJob, JobStatus
 from utils.paths import TEMP
 
+# Progress weight floor, so zero-byte/unstattable inputs still count for something.
+_MIN_WEIGHT = 1024
 
-class BatchConversionWorker(QThread):
-    progress_updated = Signal(int)
-    per_file_progress = Signal(int)
-    status_message = Signal(str)
-    speed_updated = Signal(str)
-    current_file_updated = Signal(str)
-    time_updated = Signal(str, str)
-    conversion_finished = Signal(int, list)
 
-    def __init__(self, task_list, delete_source=False):
+class _TaskSignals(QObject):
+    started = Signal(int)                 # job_id
+    progress = Signal(int, int)           # job_id, percent
+    finished = Signal(int, str)           # job_id, output_path
+    failed = Signal(int, str)             # job_id, error message
+    cancelled = Signal(int)               # job_id
+
+
+class _ConversionTask(QRunnable):
+    """Converts one file, writing to a temp path and moving it into place.
+
+    Writing to ``TEMP`` first means a crashed or cancelled conversion never
+    leaves a half-written file at the destination.
+    """
+
+    def __init__(self, job: ConversionJob, signals: _TaskSignals, control: "_BatchControl"):
         super().__init__()
-        self.task_list = task_list
-        self.total = len(task_list)
-        self.converted = 0
-        self.errors = []
-        self.is_paused = False
-        self.is_cancelled = False
-        self.delete_source = delete_source
-        self.current_worker = None
-        self._stop_requested = False
+        self.job = job
+        self.signals = signals
+        self.control = control
+        self.process = None
+        self._process_lock = threading.Lock()
+        self._cancelled = False
+        self.setAutoDelete(True)
 
-    def pause(self):
-        self.is_paused = True
-        if self.current_worker:
-            self.current_worker.pause()
+    # ---------- process control ----------
+    def suspend(self):
+        with self._process_lock:
+            process = self.process
+        if process and process.poll() is None:
+            try:
+                psutil.Process(process.pid).suspend()
+            except Exception as exc:
+                if os.name == "posix":
+                    try:
+                        os.kill(process.pid, signal.SIGSTOP)
+                    except Exception as inner:
+                        logger.error("Suspend failed for PID %s: %s", process.pid, inner)
+                else:
+                    logger.error("Suspend failed for PID %s: %s", process.pid, exc)
 
     def resume(self):
-        self.is_paused = False
-        if self.current_worker:
-            self.current_worker.resume()
-
-    def cancel(self):
-        self.is_cancelled = True
-        if self.current_worker:
-            self.current_worker.cancel()
-
-    def run(self):
-        self.start_time = time.time()
-        self.bytes_processed = 0
-
-        for idx, (converter, input_file, output_file) in enumerate(self.task_list, start=1):
-            if self.is_cancelled or self._stop_requested:
-                break
-
-            while self.is_paused:
-                time.sleep(0.1)
-
-            self.current_file_updated.emit(Path(input_file).name)
-            self.status_message.emit(f"{lang.lang.get('Converting')} {idx}/{self.total}...")
-
-            worker = ConversionWorker(converter, [(input_file, output_file)], self.delete_source)
-            self.current_worker = worker
-
-            worker.per_file_progress.connect(self.per_file_progress.emit)
-            worker.speed_updated.connect(self.speed_updated.emit)
-            worker.time_updated.connect(self.time_updated.emit)
-
-            worker.start()
-            worker.wait()
-
-            if worker.errors:
-                self.errors.extend(worker.errors)
-            else:
-                self.converted += 1
-
-            self.progress_updated.emit(idx)
-            self.bytes_processed += worker.bytes_processed
-
-            if self.is_cancelled:
-                break
-
-        self.conversion_finished.emit(self.converted, self.errors)
-
-
-class ConversionWorker(QThread):
-    progress_updated = Signal(int)
-    per_file_progress = Signal(int)
-    status_message = Signal(str)
-    speed_updated = Signal(str)
-    current_file_updated = Signal(str)
-    time_updated = Signal(str, str)
-    conversion_finished = Signal(int, list)
-
-    def __init__(self, converter, file_pairs, delete_source=False):
-        super().__init__()
-        self.converter = converter
-        self.file_pairs = file_pairs
-        self.converted = 0
-        self.errors = []
-        self.is_paused = False
-        self.is_cancelled = False
-        self.start_time = None
-        self.bytes_processed = 0
-        self.delete_source = delete_source
-        self.current_process = None
-
-    def pause(self):
-        self.is_paused = True
-        if self.current_process and self.current_process.poll() is None:
+        with self._process_lock:
+            process = self.process
+        if process and process.poll() is None:
             try:
-                psutil.Process(self.current_process.pid).suspend()
-                logger.info(f"Suspended FFmpeg PID {self.current_process.pid}")
-            except Exception as e:
-                # Fallback: try POSIX signals if psutil suspend fails
-                try:
-                    if os.name == 'posix':
-                        os.kill(self.current_process.pid, signal.SIGSTOP)
-                        logger.info(f"Sent SIGSTOP to FFmpeg PID {self.current_process.pid}")
-                    else:
-                        logger.error(f"Failed to suspend FFmpeg PID {self.current_process.pid}: {e}")
-                except Exception as e2:
-                    logger.error(f"Suspend fallback failed: {e2}")
+                psutil.Process(process.pid).resume()
+            except Exception as exc:
+                if os.name == "posix":
+                    try:
+                        os.kill(process.pid, signal.SIGCONT)
+                    except Exception as inner:
+                        logger.error("Resume failed for PID %s: %s", process.pid, inner)
+                else:
+                    logger.error("Resume failed for PID %s: %s", process.pid, exc)
 
-    def resume(self):
-        self.is_paused = False
-        if self.current_process and self.current_process.poll() is None:
+    def kill(self):
+        self._cancelled = True
+        with self._process_lock:
+            process = self.process
+        if process and process.poll() is None:
             try:
-                psutil.Process(self.current_process.pid).resume()
-                logger.info(f"Resumed FFmpeg PID {self.current_process.pid}")
-            except Exception as e:
-                # Fallback: try POSIX signals if psutil resume fails
-                try:
-                    if os.name == 'posix':
-                        os.kill(self.current_process.pid, signal.SIGCONT)
-                        logger.info(f"Sent SIGCONT to FFmpeg PID {self.current_process.pid}")
-                    else:
-                        logger.error(f"Failed to resume FFmpeg PID {self.current_process.pid}: {e}")
-                except Exception as e2:
-                    logger.error(f"Resume fallback failed: {e2}")
-
-    def cancel(self):
-        self.is_cancelled = True
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                proc = psutil.Process(self.current_process.pid)
-                children = proc.children(recursive=True)
-                for child in children:
+                proc = psutil.Process(process.pid)
+                for child in proc.children(recursive=True):
                     child.kill()
                 proc.kill()
-                proc.wait(timeout=2)
-                logger.info(f"Force-killed FFmpeg PID {self.current_process.pid}")
+                proc.wait(timeout=3)
             except psutil.NoSuchProcess:
                 pass
-            except Exception as e:
-                logger.warning(f"Psutil kill failed, falling back to subprocess: {e}")
+            except Exception as exc:
+                logger.warning("psutil kill failed (%s); using subprocess.kill", exc)
                 try:
-                    self.current_process.kill()
-                    self.current_process.wait(timeout=2)
+                    process.kill()
+                    process.wait(timeout=3)
                 except Exception:
                     pass
 
+    def _set_process(self, process):
+        with self._process_lock:
+            self.process = process
+        # A process spawned while the batch is paused must start out suspended.
+        if self.control.is_paused:
+            self.suspend()
+
+    def _should_cancel(self) -> bool:
+        return self._cancelled or self.control.is_cancelled
+
+    # ---------- execution ----------
     def run(self):
-        total_files = len(self.file_pairs)
-        self.start_time = time.time()
+        job = self.job
+        # The planner attaches an options-configured converter; fall back to the
+        # template so a directly-constructed job still runs.
+        converter = job.run_converter or job.converter
+        input_file = job.input_path
+        output_file = job.output_path
 
-        for index, (input_file, output_file) in enumerate(self.file_pairs, start=1):
-            if self.is_cancelled:
-                break
+        if self._should_cancel():
+            self.signals.cancelled.emit(job.job_id)
+            return
 
-            while self.is_paused:
-                time.sleep(0.1)
+        self.signals.started.emit(job.job_id)
 
-            self.current_file_updated.emit(Path(input_file).name)
-            self.status_message.emit(f"{lang.lang.get('Converting')} {index}/{total_files}...")
+        # Unique temp name: parallel jobs must not share a scratch file.
+        temp_output = TEMP / f"tmp_{job.job_id}_{Path(output_file).name}"
+        moved = False
 
-            temp_output = str(TEMP / f"temp_{Path(output_file).name}")
-            os.makedirs(os.path.dirname(temp_output), exist_ok=True)
-            moved = False
+        try:
+            os.makedirs(str(TEMP), exist_ok=True)
+            logger.info("Converting %s -> %s via %s", input_file, output_file, converter.name)
+            started_at = time.time()
 
-            try:
-                file_size = Path(input_file).stat().st_size
-                logger.info("================================================")
-                logger.info("Conversion")
-                logger.info("Input: %s", input_file)
-                logger.info("Output: %s", output_file)
-                logger.info("Converter: %s", self.converter.name)
-                start_file = time.time()
+            if hasattr(converter, "convert_with_progress"):
+                converter.convert_with_progress(
+                    input_file,
+                    str(temp_output),
+                    progress_callback=self._on_progress,
+                    should_cancel=self._should_cancel,
+                    process_callback=self._set_process,
+                )
+            else:
+                # Pillow and similar blocking converters give no progress feed.
+                self.control.wait_if_paused(self._should_cancel)
+                if self._should_cancel():
+                    raise _Cancelled()
+                converter.convert(input_file, str(temp_output))
+                self.signals.progress.emit(job.job_id, 100)
 
-                if hasattr(self.converter, "convert_with_progress"):
-                    def _progress_cb(percent, elapsed_sec, remaining_sec):
-                        while self.is_paused:
-                            time.sleep(0.1)
+            if self._should_cancel():
+                raise _Cancelled()
 
-                        elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed_sec))
-                        remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining_sec)) if remaining_sec else "00:00:00"
+            destination = Path(output_file)
+            os.makedirs(str(destination.parent), exist_ok=True)
+            # shutil.move refuses to clobber on some platforms; remove first.
+            if destination.exists():
+                try:
+                    destination.unlink()
+                except OSError as exc:
+                    raise RuntimeError(f"Cannot replace existing file: {exc}") from exc
+            shutil.move(str(temp_output), str(destination))
+            moved = True
 
-                        try:
-                            bytes_for_file = int(file_size * (percent / 100.0))
-                        except Exception:
-                            bytes_for_file = 0
+            logger.info("Done in %.2fs: %s", time.time() - started_at, output_file)
 
-                        total_processed = self.bytes_processed + bytes_for_file
-                        total_elapsed = time.time() - self.start_time if self.start_time else elapsed_sec
-                        speed_mbps = (total_processed / (1024 * 1024)) / max(total_elapsed, 0.001)
+            if job.options.delete_source:
+                try:
+                    os.remove(input_file)
+                    logger.info("Deleted source %s", input_file)
+                except OSError as exc:
+                    logger.warning("Could not delete source %s: %s", input_file, exc)
 
-                        self.per_file_progress.emit(int(percent))
-                        self.time_updated.emit(elapsed_text, remaining_text)
-                        self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
+            self.signals.progress.emit(job.job_id, 100)
+            self.signals.finished.emit(job.job_id, output_file)
 
-                    self.converter.convert_with_progress(
-                        input_file,
-                        temp_output,
-                        progress_callback=_progress_cb,
-                        should_cancel=lambda: self.is_cancelled,
-                        process_callback=lambda proc: setattr(self, 'current_process', proc)
-                    )
-                else:
-                    self.converter.convert(input_file, temp_output)
-
-                os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                shutil.move(temp_output, output_file)
-                moved = True
-
-                duration = time.time() - start_file
-                self.bytes_processed += file_size
-                self.converted += 1
-
-                if self.delete_source:
-                    try:
-                        os.remove(input_file)
-                        logger.info("Deleted source: %s", input_file)
-                    except Exception as e:
-                        logger.warning("Could not delete source: %s", e)
-
-                logger.info("Duration: %.2f seconds", duration)
-                logger.info("Success")
-            except Exception as exc:
+        except _Cancelled:
+            self.signals.cancelled.emit(job.job_id)
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            if self._should_cancel() or "cancelled" in message.lower():
+                self.signals.cancelled.emit(job.job_id)
+            else:
                 logger.exception("Conversion failed for %s", input_file)
-                self.errors.append(f"{Path(input_file).name}: {exc}")
-                if self.is_cancelled:
-                    self.status_message.emit(lang.lang.get("Cancel"))
-                    break
-            finally:
-                if not moved and os.path.exists(temp_output):
-                    try:
-                        os.remove(temp_output)
-                        logger.info("Removed temporary file: %s", temp_output)
-                    except Exception as e:
-                        logger.warning("Failed to remove temporary file: %s", e)
-                self.current_process = None
+                self.signals.failed.emit(job.job_id, message)
+        finally:
+            with self._process_lock:
+                self.process = None
+            if not moved and temp_output.exists():
+                try:
+                    temp_output.unlink()
+                except OSError as exc:
+                    logger.warning("Could not remove temp file %s: %s", temp_output, exc)
 
-            elapsed = time.time() - self.start_time
-            remaining = 0.0
-            if index > 0 and index < total_files:
-                remaining = elapsed / index * (total_files - index)
+    def _on_progress(self, percent, _elapsed, _remaining):
+        self.control.wait_if_paused(self._should_cancel)
+        self.signals.progress.emit(self.job.job_id, int(max(0, min(100, percent))))
 
-            elapsed_text = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            remaining_text = time.strftime("%H:%M:%S", time.gmtime(remaining))
 
-            speed_mbps = (self.bytes_processed / (1024 * 1024)) / max(elapsed, 0.001)
-            self.speed_updated.emit(f"{speed_mbps:.2f} MB/s")
-            self.time_updated.emit(elapsed_text, remaining_text)
-            self.progress_updated.emit(index)
-            self.per_file_progress.emit(100)
+class _Cancelled(Exception):
+    """Raised internally to unwind a cancelled conversion."""
 
-        self.conversion_finished.emit(self.converted, self.errors)
+
+class _BatchControl:
+    """Thread-safe pause/cancel flags shared by every running task."""
+
+    def __init__(self):
+        self._resumed = threading.Event()
+        self._resumed.set()
+        self._cancelled = threading.Event()
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._resumed.is_set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def pause(self):
+        self._resumed.clear()
+
+    def resume(self):
+        self._resumed.set()
+
+    def cancel(self):
+        self._cancelled.set()
+        self._resumed.set()   # release anyone blocked in wait_if_paused
+
+    def wait_if_paused(self, should_cancel=None):
+        while not self._resumed.wait(timeout=0.1):
+            if should_cancel and should_cancel():
+                return
+
+
+class ConversionCoordinator(QObject):
+    """Drives a batch of jobs across a pool of worker threads."""
+
+    # Per-job updates, keyed by job_id.
+    job_started = Signal(int)
+    job_progress = Signal(int, int)
+    job_succeeded = Signal(int, str)
+    job_failed = Signal(int, str)
+    job_cancelled = Signal(int)
+
+    # Aggregate updates for the progress dock.
+    batch_progress = Signal(int)                  # weighted percent 0-100
+    batch_counts = Signal(int, int, int)          # completed, failed, total
+    batch_stats = Signal(float, float, float)     # bytes/sec, elapsed sec, eta sec
+    batch_finished = Signal(int, int, int)        # succeeded, failed, cancelled
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pool = QThreadPool(self)
+        self._signals = _TaskSignals()
+        self._control = _BatchControl()
+
+        self._signals.started.connect(self._on_started)
+        self._signals.progress.connect(self._on_progress)
+        self._signals.finished.connect(self._on_finished)
+        self._signals.failed.connect(self._on_failed)
+        self._signals.cancelled.connect(self._on_cancelled)
+
+        self._tasks: Dict[int, _ConversionTask] = {}
+        self._weights: Dict[int, float] = {}
+        self._percent: Dict[int, int] = {}
+        self._total_weight = 0.0
+        self._total = 0
+        self._succeeded = 0
+        self._failed = 0
+        self._cancelled_count = 0
+        self._settled = 0
+        self._start_time = 0.0
+        self._running = False
+        self._finish_emitted = False
+
+    # ---------- lifecycle ----------
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def is_paused(self) -> bool:
+        return self._control.is_paused
+
+    def start(self, jobs: List[ConversionJob], concurrency: int = 1) -> int:
+        """Dispatch ``jobs``. Returns the number actually queued."""
+        if self._running:
+            raise RuntimeError("A batch is already running")
+        if not jobs:
+            return 0
+
+        self._control = _BatchControl()
+        self._tasks.clear()
+        self._weights.clear()
+        self._percent.clear()
+        self._succeeded = self._failed = self._cancelled_count = self._settled = 0
+        self._finish_emitted = False
+        self._total = len(jobs)
+        self._start_time = time.time()
+        self._running = True
+
+        for job in jobs:
+            self._weights[job.job_id] = max(_MIN_WEIGHT, job.source_size)
+            self._percent[job.job_id] = 0
+        self._total_weight = sum(self._weights.values()) or 1.0
+
+        self._pool.setMaxThreadCount(max(1, int(concurrency)))
+        self.batch_counts.emit(0, 0, self._total)
+        self.batch_progress.emit(0)
+
+        for job in jobs:
+            task = _ConversionTask(job, self._signals, self._control)
+            self._tasks[job.job_id] = task
+            self._pool.start(task)
+
+        return self._total
+
+    def pause(self):
+        if not self._running:
+            return
+        self._control.pause()
+        for task in list(self._tasks.values()):
+            task.suspend()
+
+    def resume(self):
+        if not self._running:
+            return
+        self._control.resume()
+        for task in list(self._tasks.values()):
+            task.resume()
+
+    def cancel(self):
+        if not self._running:
+            return
+        self._control.cancel()
+        # Drop everything not yet started, then kill what is running.
+        self._pool.clear()
+        for task in list(self._tasks.values()):
+            task.kill()
+
+    def cancel_job(self, job_id: int):
+        task = self._tasks.get(job_id)
+        if task:
+            task.kill()
+
+    def wait(self, timeout_ms: int = 10000) -> bool:
+        return self._pool.waitForDone(timeout_ms)
+
+    def shutdown(self):
+        if self._running:
+            self.cancel()
+        self._pool.waitForDone(5000)
+
+    # ---------- task callbacks ----------
+    def _on_started(self, job_id: int):
+        self.job_started.emit(job_id)
+
+    def _on_progress(self, job_id: int, percent: int):
+        self._percent[job_id] = percent
+        self.job_progress.emit(job_id, percent)
+        self._emit_aggregate()
+
+    def _on_finished(self, job_id: int, output_path: str):
+        self._percent[job_id] = 100
+        self._succeeded += 1
+        self.job_succeeded.emit(job_id, output_path)
+        self._settle(job_id)
+
+    def _on_failed(self, job_id: int, message: str):
+        self._failed += 1
+        self.job_failed.emit(job_id, message)
+        self._settle(job_id)
+
+    def _on_cancelled(self, job_id: int):
+        self._cancelled_count += 1
+        self.job_cancelled.emit(job_id)
+        self._settle(job_id)
+
+    def _settle(self, job_id: int):
+        self._tasks.pop(job_id, None)
+        self._settled += 1
+        self.batch_counts.emit(self._succeeded, self._failed, self._total)
+        self._emit_aggregate()
+
+        if self._settled >= self._total and not self._finish_emitted:
+            self._finish_emitted = True
+            self._running = False
+            self.batch_progress.emit(100)
+            self.batch_finished.emit(self._succeeded, self._failed, self._cancelled_count)
+
+    # ---------- aggregate maths ----------
+    def _emit_aggregate(self):
+        if self._total_weight <= 0:
+            return
+
+        done_weight = sum(
+            self._weights.get(job_id, 0) * (percent / 100.0)
+            for job_id, percent in self._percent.items()
+        )
+        fraction = min(1.0, done_weight / self._total_weight)
+        self.batch_progress.emit(int(fraction * 100))
+
+        elapsed = max(0.001, time.time() - self._start_time)
+        speed = done_weight / elapsed
+        # Extrapolate from observed throughput; only meaningful once underway.
+        eta = ((self._total_weight - done_weight) / speed) if speed > 0 and fraction > 0.01 else 0.0
+        self.batch_stats.emit(speed, elapsed, eta)
