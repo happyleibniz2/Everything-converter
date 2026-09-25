@@ -148,7 +148,7 @@ class PricingCard(CardWidget):
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(28 if recommended else 18)
         shadow.setColor(QColor(0, 0, 0, 60 if isDarkTheme() else 34))
-        shadow.setOffsetY(6)
+        shadow.setOffset(0, 6)
         self.setGraphicsEffect(shadow)
 
     def _apply_state(self, current: bool):
