@@ -76,6 +76,7 @@ RANKS: List[Rank] = [
         features=(
             "Everything in Bronze",
             "Per-File Customizations (unlimited overrides)",
+            "3D model rendering preview with texture support",
             "Advanced codec, filter and container options",
             "Parallel batches up to 8 jobs",
             "VIP badge on your queue",
@@ -134,6 +135,11 @@ FEATURES: Dict[str, Tuple[int, str, str]] = {
     "unlimited_parallel": (
         2, "Unlimited Parallel Jobs",
         "Raise the concurrent-conversion cap beyond the free limit.",
+    ),
+    "model_rendering": (
+        2, "3D Model Rendering",
+        "Interactive preview of STL, OBJ, glTF/GLB, CAD and USD/USDZ models, "
+        "with texture painting baked into the export.",
     ),
     "all_features": (
         3, "Everything Unlocked",
