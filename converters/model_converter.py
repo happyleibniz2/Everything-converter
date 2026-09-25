@@ -25,6 +25,7 @@ from typing import Optional, Tuple
 
 from converters.base import Converter
 from converters.usd_export import PXR_AVAILABLE, register as register_usd_exporters
+from converters.usd_import import register as register_usd_loaders
 
 # Formats trimesh can read out of the box on any machine.
 MODEL_INPUT_EXTENSIONS: Tuple[str, ...] = (
@@ -69,6 +70,7 @@ def trimesh_available() -> bool:
     if not _module("trimesh"):
         return False
     register_usd_exporters()
+    register_usd_loaders()  # trimesh's wheel has no usd/usdz loader of its own
     return True
 
 

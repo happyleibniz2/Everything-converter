@@ -1,7 +1,5 @@
-# Python compiled files
+# Python compiled files and caches
 __pycache__/
 *.pyc
 
-# Environment
-.env
-.env.local
+# IDE/Editor files (if any were present, but none in this specific change list other than pycache)
