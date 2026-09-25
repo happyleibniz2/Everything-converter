@@ -6,7 +6,7 @@ heuristics miss.
 """
 
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -19,6 +19,18 @@ from qfluentwidgets import (
 )
 
 import lang
+from services.ranks import EFFORT_MAX, RankManager
+from ui.widgets.badge import RankBadge
+
+# Effort levels for the Error Assistant. Normal ranks analyze with "default"
+# effort; Bronze and above (and dev mode) analyze with "max" effort, which
+# enables the extended diagnostics, deeper log scanning and remediation plans.
+EFFORT_DEFAULT = "default"
+
+
+def current_effort() -> str:
+    """The effort level the current user's rank entitles them to."""
+    return RankManager.instance().error_assistant_effort
 
 # (regex, [advice keys]). Ordered most-specific first; all matches contribute.
 DIAGNOSTICS: List[Tuple[str, List[str]]] = [
@@ -77,26 +89,109 @@ FALLBACK_ADVICE = [
     "Check the raw output below, and the log files listed in Settings.",
 ]
 
+# Extra patterns only evaluated at MAX effort (Bronze and above, or dev mode).
+# They catch subtler failure modes that the default heuristics intentionally
+# skip to keep free-tier answers short and safe.
+MAX_EFFORT_DIAGNOSTICS: List[Tuple[str, List[str]]] = [
+    (r"nvenc|quicksync|qsv|amf|vaapi|cuda", [
+        "The GPU encoder rejected this request.",
+        "Update your graphics driver, lower the resolution or bitrate, or switch back to CPU encoding.",
+    ]),
+    (r"bit rate.*too high|exceeds.*maximum|too large for container", [
+        "The chosen bitrate exceeds what the container or target format allows.",
+        "Lower the bitrate or CRF, or pick a container with a higher ceiling such as MKV.",
+    ]),
+    (r"sample rate|channels|audio codec|resample", [
+        "The audio stream conflicts with the output settings.",
+        "Force a common layout with -ar 48000 -ac 2 under Advanced, or drop audio and remux.",
+    ]),
+    (r"timebase|timestamp|pts|dts", [
+        "Timestamps in the source are inconsistent, which breaks some muxers.",
+        "Enable 'Remux only' first to test, or add -fflags +genpts under Advanced.",
+    ]),
+    (r"thread|deadlock|assertion|segmentation", [
+        "This looks like an internal FFmpeg fault rather than a settings problem.",
+        "Reduce 'Files at once' in Settings and retry; if it persists, convert the file alone.",
+    ]),
+    (r"timeout|timed out|stalled", [
+        "The conversion stalled before finishing.",
+        "Check the drive the source lives on (network drives often stall), then retry from a local copy.",
+    ]),
+    (r"unsupported|not implemented", [
+        "The requested feature combination is not supported by this FFmpeg build.",
+        "Simplify the pipeline: one codec change at a time, without extra filters.",
+    ]),
+    (r"encrypted|drm|protected", [
+        "The source file is encrypted or DRM-protected.",
+        "Only unencrypted media can be converted; export a plain file from the original app first.",
+    ]),
+]
 
-def analyze_error(error_text: str) -> List[str]:
-    """Return ordered, de-duplicated advice for one error message."""
+# Deeper follow-up steps appended to matched advice at MAX effort, keyed by
+# advice line so each diagnosis gains concrete, ordered actions.
+MAX_EFFORT_FOLLOWUPS = {
+    "Pick a different output format, such as MP4 with H.264.":
+        "Try MP4/H.264 first — it works everywhere. Then re-add your preferred codec via Advanced.",
+    "Choose a different output folder in Settings, or run as administrator.":
+        "Good targets: your user Downloads folder, or a second internal drive formatted NTFS/exFAT.",
+    "Use H.264 for MP4, VP9 for WebM, or enable Remux only if the streams already match.":
+        "Quickest path: set the codec to H.264, leave everything else on Auto, and retry just this file.",
+}
+
+
+def analyze_error(error_text: str, effort: Optional[str] = None) -> List[str]:
+    """Return ordered, de-duplicated advice for one error message.
+
+    ``effort`` selects how hard the assistant thinks:
+      * ``"default"`` — Normal rank: the core heuristics only.
+      * ``"max"``     — Bronze and above (and dev mode): core heuristics plus
+        the extended diagnostics, deeper log scanning and follow-up steps.
+    When omitted, the current user's rank decides.
+    """
+    if effort is None:
+        effort = current_effort()
+    max_effort = effort == EFFORT_MAX
+
     text = str(error_text or "").lower()
     advice: List[str] = []
 
-    for pattern, suggestions in DIAGNOSTICS:
-        if re.search(pattern, text):
-            for suggestion in suggestions:
-                translated = lang.lang.get(suggestion)
-                if translated not in advice:
-                    advice.append(translated)
+    def collect(entries):
+        for pattern, suggestions in entries:
+            if re.search(pattern, text):
+                for suggestion in suggestions:
+                    translated = lang.lang.get(suggestion)
+                    if translated not in advice:
+                        advice.append(translated)
+                        if max_effort:
+                            followup = MAX_EFFORT_FOLLOWUPS.get(suggestion)
+                            if followup:
+                                followup = lang.lang.get(followup)
+                                if followup not in advice:
+                                    advice.append("   ↳ " + followup)
+
+    collect(DIAGNOSTICS)
+    if max_effort:
+        # Max effort scans the whole log, not just the tail, and adds every
+        # extended pattern that matches.
+        collect(MAX_EFFORT_DIAGNOSTICS)
 
     if not advice:
         advice = [lang.lang.get(item) for item in FALLBACK_ADVICE]
+        if max_effort:
+            advice.append(lang.lang.get(
+                "Max-effort scan found no known failure signature. "
+                "Attach the raw output when contacting support for a faster answer."
+            ))
     return advice
 
 
 class ErrorAssistant(MessageBoxBase):
-    """Lists failures with a diagnosis and the raw output for each."""
+    """Lists failures with a diagnosis and the raw output for each.
+
+    Analysis depth depends on the user's rank: Normal runs at default effort,
+    Bronze/Silver/Gold (and dev mode) run at max effort — extended patterns,
+    follow-up steps and a deeper log scan.
+    """
 
     def __init__(self, failures, parent=None):
         """``failures`` is a sequence of ``(filename, error_message)``."""
@@ -104,6 +199,8 @@ class ErrorAssistant(MessageBoxBase):
         self.failures = [
             (name, message) for name, message in (failures or []) if message
         ]
+        self.effort = current_effort()
+        self._manager = RankManager.instance()
         self._build()
         self.yesButton.setText(lang.lang.get("Close"))
         self.cancelButton.hide()
@@ -113,12 +210,29 @@ class ErrorAssistant(MessageBoxBase):
             self.list_widget.setCurrentRow(0)
             self._show_failure(0)
 
+    def rank_for_badge(self):
+        """The rank shown next to the header (dev mode shows the user's rank)."""
+        return self._manager.rank
+
+    def _effort_caption(self) -> str:
+        if self.effort == EFFORT_MAX:
+            return lang.lang.get("Error Assistant · max effort")
+        return lang.lang.get(
+            "Error Assistant · default effort — upgrade to Bronze for max-effort diagnosis."
+        )
+
     def _build(self):
         self.viewLayout.setSpacing(10)
 
-        self.viewLayout.addWidget(
+        header = QHBoxLayout()
+        header.addWidget(
             SubtitleLabel(f"{len(self.failures)} {lang.lang.get('conversion(s) failed')}", self)
         )
+        header.addStretch(1)
+        header.addWidget(RankBadge(self.rank_for_badge(), self))
+        self.viewLayout.addLayout(header)
+        self.effort_caption = CaptionLabel(self._effort_caption(), self)
+        self.viewLayout.addWidget(self.effort_caption)
         self.viewLayout.addWidget(
             CaptionLabel(lang.lang.get("Select a file to see what went wrong."), self)
         )
@@ -164,7 +278,7 @@ class ErrorAssistant(MessageBoxBase):
         if not (0 <= row < len(self.failures)):
             return
         _name, message = self.failures[row]
-        advice = analyze_error(message)
+        advice = analyze_error(message, effort=self.effort)
         self.advice_label.setText("\n".join(f"\u2022  {item}" for item in advice))
         self.raw_output.setPlainText(message)
 
@@ -173,6 +287,6 @@ class ErrorAssistant(MessageBoxBase):
         if not (0 <= row < len(self.failures)):
             return
         name, message = self.failures[row]
-        advice = "\n".join(analyze_error(message))
+        advice = "\n".join(analyze_error(message, effort=self.effort))
         QApplication.clipboard().setText(f"{name}\n\n{advice}\n\n{message}")
         self.copy_button.setText(lang.lang.get("Copied"))

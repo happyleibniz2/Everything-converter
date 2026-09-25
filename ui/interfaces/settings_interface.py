@@ -1,15 +1,18 @@
 """Settings as a scrollable page of Fluent setting cards.
 
-Replaces the old tabbed modal dialog. Every change is written to ``QSettings``
-immediately, which removes a whole class of "did my change stick?" confusion.
+Replaces the old tabbed modal dialog. There is no OK button: theme, accent
+colour, language, output rules, parallelism and the default preset are each
+written to ``QSettings`` (and flushed with ``sync()``) the moment the control
+changes, which removes a whole class of "did my change stick?" confusion.
 """
 
 from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
-    ColorPickerButton, ComboBox, FluentIcon, LineEdit, PushButton, ScrollArea,
-    SettingCard, SettingCardGroup, SpinBox, SubtitleLabel, SwitchButton,
+    CaptionLabel, ColorPickerButton, ComboBox, FluentIcon, LineEdit, PushButton,
+    ScrollArea, SettingCard, SettingCardGroup, SpinBox, SubtitleLabel,
+    SwitchButton,
 )
 
 import lang
@@ -51,10 +54,18 @@ class ControlCard(SettingCard):
 
 
 class SettingsInterface(ScrollArea):
-    """Live-applied application preferences."""
+    """Live-applied application preferences.
+
+    There is no OK/Apply button anywhere on this page: every control writes
+    straight to ``QSettings`` the moment it changes, and ``settingsChanged``
+    lets the rest of the app react (re-estimating queue sizes, refreshing
+    destination previews, ...) without ever losing an edit.
+    """
 
     language_changed = Signal(str)
     appearance_changed = Signal()
+    #: Emitted after a preference has been persisted; carries the key.
+    settingsChanged = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -80,6 +91,11 @@ class SettingsInterface(ScrollArea):
 
         self.heading = SubtitleLabel(lang.lang.get("Settings"), self._view)
         layout.addWidget(self.heading)
+        # Make it obvious there is nothing to confirm: edits persist live.
+        self.autosave_note = CaptionLabel(
+            lang.lang.get("Changes are saved automatically as you make them."),
+            self._view)
+        layout.addWidget(self.autosave_note)
         layout.addWidget(self._appearance_group())
         layout.addWidget(self._output_group())
         layout.addWidget(self._performance_group())
@@ -146,8 +162,11 @@ class SettingsInterface(ScrollArea):
         self.folder_edit = LineEdit()
         self.folder_edit.setMinimumWidth(230)
         self.folder_edit.setPlaceholderText(lang.lang.get("Choose a folder"))
-        self.folder_edit.editingFinished.connect(
-            lambda: self._store("custom_folder", self.folder_edit.text()))
+        # textEdited fires only for user keystrokes (setText during _load does
+        # not re-store); editingFinished catches focus-out and Enter as well.
+        self.folder_edit.textEdited.connect(
+            lambda text: self._store("custom_folder", text))
+        self.folder_edit.editingFinished.connect(self._on_folder_edited)
         self.browse_button = PushButton(FluentIcon.FOLDER.icon(), lang.lang.get("Browse"))
         self.browse_button.clicked.connect(self._browse_folder)
         folder_row.addWidget(self.folder_edit)
@@ -232,9 +251,18 @@ class SettingsInterface(ScrollArea):
         return group
     # ------------------------------------------------------------ handlers --
     def _store(self, key, value):
-        # Suppressed during _load so populating widgets does not re-save.
-        if not self._loading:
-            self.settings.setValue(key, value)
+        """Persist one preference immediately — there is no OK button.
+
+        ``QSettings.sync()`` forces the write to disk now rather than at an
+        arbitrary later point, so a crash can never lose a change. Suppressed
+        during ``_load`` so populating widgets does not re-save; the
+        ``settingsChanged`` signal lets other parts of the app react live.
+        """
+        if self._loading:
+            return
+        self.settings.setValue(key, value)
+        self.settings.sync()
+        self.settingsChanged.emit(key)
 
     def _on_theme_changed(self, _index):
         value = self.theme_combo.currentData() or "auto"
@@ -264,6 +292,10 @@ class SettingsInterface(ScrollArea):
         self._store("output_folder_mode", index)
         # The custom-folder row is only meaningful for the Custom option.
         self.folder_card.setEnabled(index == 2)
+
+    def _on_folder_edited(self):
+        """Save the typed folder as soon as focus leaves the line edit."""
+        self._store("custom_folder", self.folder_edit.text())
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, lang.lang.get("Select output folder"))
@@ -332,6 +364,8 @@ class SettingsInterface(ScrollArea):
     # ---------------------------------------------------------------- i18n --
     def retranslate(self):
         self.heading.setText(lang.lang.get("Settings"))
+        self.autosave_note.setText(
+            lang.lang.get("Changes are saved automatically as you make them."))
 
         # Rebuild translated combo entries while preserving each selection.
         self._loading = True

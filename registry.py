@@ -1,9 +1,10 @@
 from pathlib import Path
 
+from converters.document_converter import AVAILABLE_DOCUMENT_CONVERTERS
 from converters.image_converter import ALL_IMAGE_CONVERTERS
 from converters.video_converter import ALL_FFMPEG_CONVERTERS
 
-CONVERTERS = ALL_IMAGE_CONVERTERS + ALL_FFMPEG_CONVERTERS
+CONVERTERS = ALL_IMAGE_CONVERTERS + ALL_FFMPEG_CONVERTERS + AVAILABLE_DOCUMENT_CONVERTERS
 
 
 def normalize_extension(extension):

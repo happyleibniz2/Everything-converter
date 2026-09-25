@@ -61,6 +61,9 @@ class MainWindow(FluentWindow):
 
         self.settings_interface.language_changed.connect(self._on_language_changed)
         self.settings_interface.appearance_changed.connect(self._on_appearance_changed)
+        # Settings persist live (no OK button); the queue reacts immediately.
+        self.settings_interface.settingsChanged.connect(
+            self.convert_interface.on_settings_changed)
         self.convert_interface.busy_changed.connect(self._on_busy_changed)
 
     def _build_navigation(self):
