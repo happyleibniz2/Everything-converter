@@ -79,6 +79,21 @@ AUDIO_SAMPLE_RATES = ["22050", "32000", "44100", "48000", "96000", "192000"]
 AUDIO_BITRATE_CHOICES = [64, 96, 128, 160, 192, 256, 320]
 
 # Category → member extensions. Drives the format browser and file-type icons.
+DOCUMENT_INPUT_EXTENSIONS = (
+    ".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz",
+)
+
+TEXT_EXTENSIONS = (".txt",)
+
+MODEL_INPUT_EXTENSIONS = (
+    ".stl", ".obj", ".gltf", ".glb", ".usd", ".usda", ".usdc", ".usdz",
+    ".ply", ".off", ".3mf", ".xyz",
+    # .dae/.fbx are recognised as "Model" files but only convert when the
+    # optional assimp backend is installed (see converters.model_converter).
+    ".dae", ".fbx",
+)
+
 CATEGORY_EXTENSIONS = {
     "Image": (
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
@@ -90,11 +105,15 @@ CATEGORY_EXTENSIONS = {
     "Audio": (
         ".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma",
     ),
+    "Document": DOCUMENT_INPUT_EXTENSIONS + TEXT_EXTENSIONS,
+    "Model": MODEL_INPUT_EXTENSIONS,
 }
 
 VIDEO_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Video"])
 AUDIO_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Audio"])
 IMAGE_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Image"])
+DOCUMENT_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Document"])
+MODEL_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Model"])
 
 
 def category_for_extension(extension: str) -> str:
@@ -108,4 +127,8 @@ def category_for_extension(extension: str) -> str:
         return "Audio"
     if extension in IMAGE_EXTENSIONS:
         return "Image"
+    if extension in DOCUMENT_EXTENSIONS:
+        return "Document"
+    if extension in MODEL_EXTENSIONS:
+        return "Model"
     return "Unknown"

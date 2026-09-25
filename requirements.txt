@@ -18,21 +18,50 @@ Pillow>=11.3.0
 # Process control for pause / resume / cancel of ffmpeg
 psutil>=7.0.0
 
-# --- Optional ---
-
 # HEIF/HEIC read and write support for Pillow
 pillow-heif>=0.18.0
 
+# --- PDF / Office / Archive conversion (converters/document_converter.py,
+#     pdf_converter.py, archive_converter.py) ---
+
+# PDF text extraction & page rendering
+PyMuPDF>=1.26.0
+
+# PDF merge / split / metadata
+pypdf>=5.0.0
+
+# Word documents (.docx -> PDF/text)
+python-docx>=1.2.0
+
+# Excel workbooks (.xlsx -> CSV/PDF)
+openpyxl>=3.1.5
+
+# PowerPoint decks (.pptx -> PDF/images)
+python-pptx>=1.0.2
+
+# 7-Zip archives
+py7zr>=1.0.0
+
+# RAR archives (needs the system `unrar`/`unar` binary at runtime)
+rarfile>=4.2
+
+# --- 3D model conversion (converters/model_converter.py, usd_export.py) ---
+
+# Mesh loading/exporting for STL/OBJ/glTF/GLB/PLY/OFF/3MF/DAE/FBX
+trimesh>=4.5.0
+
+# Geometry math used by trimesh and the renderer
+numpy>=2.0.0
+
+# USD / USDA / USDC / USDZ export via the official OpenUSD Python bindings
+usd-core>=24.11
+
+# --- Optional: FBX / COLLADA (.fbx, .dae) model input ---
+# trimesh can only read these through Assimp. Install the package AND the
+# native library (Linux: apt install libassimp-dev; Windows: grab the Assimp
+# DLL). Without it the app still runs — those two formats just show a hint
+# instead of crashing the worker.
+# pyassimp>=4.1.4
+
 # --- Bundled, not installed via pip ---
 # FFmpeg and ffprobe ship in ./ffmpeg and handle all audio/video work.
-
-# --- Planned (converters not implemented yet) ---
-# Uncomment alongside the matching converter in ./converters
-# pypdf>=5.0.0
-# PyMuPDF>=1.26.0
-# python-docx>=1.2.0
-# openpyxl>=3.1.5
-# python-pptx>=1.0.2
-# py7zr>=1.0.0
-# rarfile>=4.2
-# PyYAML>=6.0.2

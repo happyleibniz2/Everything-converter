@@ -20,6 +20,7 @@ import lang
 from logger import logger
 from ui.interfaces.convert_interface import ConvertInterface
 from ui.interfaces.formats_interface import FormatsInterface
+from ui.interfaces.pricing_interface import PricingInterface
 from ui.interfaces.settings_interface import SettingsInterface
 from utils.paths import RESOURCES
 
@@ -57,10 +58,14 @@ class MainWindow(FluentWindow):
     def _build_interfaces(self):
         self.convert_interface = ConvertInterface(self)
         self.formats_interface = FormatsInterface(self)
+        self.pricing_interface = PricingInterface(self)
         self.settings_interface = SettingsInterface(self)
 
         self.settings_interface.language_changed.connect(self._on_language_changed)
         self.settings_interface.appearance_changed.connect(self._on_appearance_changed)
+        # Settings persist live (no OK button); the queue reacts immediately.
+        self.settings_interface.settingsChanged.connect(
+            self.convert_interface.on_settings_changed)
         self.convert_interface.busy_changed.connect(self._on_busy_changed)
 
     def _build_navigation(self):
@@ -68,6 +73,8 @@ class MainWindow(FluentWindow):
                              lang.lang.get("Convert"))
         self.addSubInterface(self.formats_interface, FluentIcon.TILES,
                              lang.lang.get("Formats"))
+        self.addSubInterface(self.pricing_interface, FluentIcon.TAG,
+                             lang.lang.get("Pricing"))
         self.addSubInterface(self.settings_interface, FluentIcon.SETTING,
                              lang.lang.get("Settings"),
                              position=NavigationItemPosition.BOTTOM)
@@ -131,7 +138,7 @@ class MainWindow(FluentWindow):
 
     def _repaint_after_theme(self):
         for widget in (self.convert_interface, self.formats_interface,
-                       self.settings_interface):
+                       self.pricing_interface, self.settings_interface):
             widget.update()
 
     # ------------------------------------------------------------------ i18n --
@@ -150,12 +157,14 @@ class MainWindow(FluentWindow):
 
         self.convert_interface.retranslate()
         self.formats_interface.retranslate()
+        self.pricing_interface.retranslate()
         self.settings_interface.retranslate()
 
         # Navigation labels are keyed by the interface object name.
         for interface, text in (
             (self.convert_interface, "Convert"),
             (self.formats_interface, "Formats"),
+            (self.pricing_interface, "Pricing"),
             (self.settings_interface, "Settings"),
         ):
             widget = self.navigationInterface.widget(interface.objectName())

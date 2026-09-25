@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QSettings, Qt, QUrl, Signal
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
@@ -692,6 +692,44 @@ class ConvertInterface(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(existing[0]).parent)))
 
     # ---------------------------------------------------------- refreshing --
+    #: Settings that feed the per-file / batch size estimates.
+    _ESTIMATE_KEYS = ("default_preset", "threads")
+    #: Settings that change where files land.
+    _DESTINATION_KEYS = ("output_folder_mode", "custom_folder", "overwrite_behavior")
+    #: Settings that apply to files added from now on; stored directly on each
+    #: job when it is queued, so only the summary needs a refresh.
+    _PER_JOB_KEYS = ("delete_source", "parallel_jobs")
+
+    def on_settings_changed(self, key: str):
+        """React live to a persisted preference — settings have no OK button.
+
+        Anything derived from a preference (size estimates, the destination
+        preview, the savings line) is recomputed the moment the value is
+        written, so the queue never shows stale numbers. Coalesced through a
+        zero-timer so a burst of changes (e.g. dragging the folder path along
+        while typing) repaints once, not per keystroke.
+        """
+        if key in self._ESTIMATE_KEYS or key in self._DESTINATION_KEYS \
+                or key in self._PER_JOB_KEYS:
+            self._pending_setting_keys.add(key)
+            if not self._settings_refresh_timer.isActive():
+                self._settings_refresh_timer.start()
+
+    def _apply_pending_settings(self):
+        keys, self._pending_setting_keys = self._pending_setting_keys, set()
+        if not keys:
+            return
+        if not len(self.queue):
+            return
+        if keys & set(self._ESTIMATE_KEYS):
+            for job in self.queue:
+                if job.has_converter and job.status is not JobStatus.DONE:
+                    self._recalculate_estimate(job)
+                    self.table.update_estimate(job)
+        self._update_summary()
+        if keys & set(self._DESTINATION_KEYS):
+            self._update_destination_preview()
+
     def _recalculate_estimate(self, job):
         if not job.has_converter:
             job.estimate_text = lang.lang.get("Unsupported")
