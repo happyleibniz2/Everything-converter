@@ -1,8 +1,7 @@
-# Python bytecode
+# Python compiled files
 __pycache__/
 *.pyc
 
-# Environment variables
-.env
-.env.local
-.env.*.local
+# Build artifacts
+dist/
+build/
