@@ -56,5 +56,12 @@ numpy>=2.0.0
 # USD / USDA / USDC / USDZ export via the official OpenUSD Python bindings
 usd-core>=24.11
 
+# --- Optional: FBX / COLLADA (.fbx, .dae) model input ---
+# trimesh can only read these through Assimp. Install the package AND the
+# native library (Linux: apt install libassimp-dev; Windows: grab the Assimp
+# DLL). Without it the app still runs — those two formats just show a hint
+# instead of crashing the worker.
+# pyassimp>=4.1.4
+
 # --- Bundled, not installed via pip ---
 # FFmpeg and ffprobe ship in ./ffmpeg and handle all audio/video work.

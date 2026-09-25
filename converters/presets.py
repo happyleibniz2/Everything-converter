@@ -88,7 +88,10 @@ TEXT_EXTENSIONS = (".txt",)
 
 MODEL_INPUT_EXTENSIONS = (
     ".stl", ".obj", ".gltf", ".glb", ".usd", ".usda", ".usdc", ".usdz",
-    ".ply", ".off", ".3mf", ".dae", ".fbx", ".xyz",
+    ".ply", ".off", ".3mf", ".xyz",
+    # .dae/.fbx are recognised as "Model" files but only convert when the
+    # optional assimp backend is installed (see converters.model_converter).
+    ".dae", ".fbx",
 )
 
 CATEGORY_EXTENSIONS = {

@@ -26,12 +26,31 @@ from typing import Optional, Tuple
 from converters.base import Converter
 from converters.usd_export import PXR_AVAILABLE, register as register_usd_exporters
 
-# Formats we can read. Everything except FBX works out of the box with trimesh.
+# Formats trimesh can read out of the box on any machine.
 MODEL_INPUT_EXTENSIONS: Tuple[str, ...] = (
     ".stl", ".obj", ".gltf", ".glb",
     ".usd", ".usda", ".usdc", ".usdz",
-    ".ply", ".off", ".3mf", ".dae", ".fbx", ".xyz",
+    ".ply", ".off", ".3mf", ".xyz",
 )
+
+# COLLADA/FBX only work when an assimp backend is importable; trimesh raises
+# NotImplementedError("file_type 'fbx' not supported") otherwise, so we keep
+# them in a separate list and expose them only when the backend shows up.
+ASSIMP_ONLY_EXTENSIONS: Tuple[str, ...] = (".dae", ".fbx")
+
+
+def _assimp_available() -> bool:
+    for module_name in ("pyassimp", "assimp"):
+        if _module(module_name):
+            return True
+    return False
+
+
+def readable_model_extensions() -> Tuple[str, ...]:
+    """Input extensions actually supported on this machine."""
+    if _assimp_available():
+        return MODEL_INPUT_EXTENSIONS + ASSIMP_ONLY_EXTENSIONS
+    return MODEL_INPUT_EXTENSIONS
 
 # Formats we can write (availability checked at runtime via trimesh).
 MODEL_OUTPUT_FORMATS = (".stl", ".obj", ".gltf", ".glb", ".usd", ".usdz", ".ply", ".off")
@@ -95,10 +114,30 @@ class ModelConverter(Converter):
         return configured
 
     # ------------------------------------------------------------ convert --
+    def _load(self, trimesh, input_file):
+        """Load a model, turning trimesh's cryptic errors into plain ones.
+
+        FBX/COLLADA need an assimp backend that most installs don't ship with;
+        trimesh just raises ``NotImplementedError: file_type 'fbx' not
+        supported`` there, which used to crash the worker with a raw traceback.
+        """
+        path = Path(str(input_file))
+        suffix = path.suffix.lower()
+        if suffix in ASSIMP_ONLY_EXTENSIONS and not _assimp_available():
+            raise RuntimeError(
+                f"{suffix[1:].upper()} files need the optional 'pyassimp' package "
+                "(pip install pyassimp, plus the system Assimp library). "
+                "Try converting to it from Blender, or export as glTF/OBJ instead."
+            )
+        try:
+            return trimesh.load(str(path), force="mesh", process=False)
+        except NotImplementedError as exc:
+            raise RuntimeError(f"This model format can't be read here: {exc}") from exc
+
     def convert(self, input_file, output_file):
         import trimesh
 
-        mesh = trimesh.load(str(input_file), force="mesh", process=False)
+        mesh = self._load(trimesh, input_file)
         if mesh is None or len(mesh.faces) == 0:
             raise RuntimeError("No mesh geometry found in the input model")
 
