@@ -194,20 +194,26 @@ def _build_usdz(mesh, texture_bytes: Optional[bytes]) -> bytes:
     return data
 
 
-def export_usd(mesh, file_obj=None, file_path: Optional[str] = None, **kwargs):
+def export_usd(mesh, file_obj=None, **kwargs):
     """Export a :class:`trimesh.Trimesh` to USD (ascii/binary) or USDZ.
 
-    Returns serialised bytes. ``file_path`` (when given) selects the flavour:
-    ``.usdz`` builds a zip archive, ``.usdc/.usd`` a binary layer, anything
-    else ascii ``.usda``. Textures are embedded in USDZ archives; for loose
-    files the caller (ModelConverter) writes the ``texture.png`` sidecar via
-    :func:`texture_sidecar_for`.
+    Registered as a trimesh mesh exporter, so it is called as
+    ``exporter(mesh, **kwargs)`` — *without* the opened file object. The
+    target therefore has to come from kwargs (``file_path=`` / ``path=``);
+    when it is missing we fall back to a binary ``.usdc`` layer, which is the
+    safest default for a bare ``mesh.export(file_type="usd")`` call.
+
+    Returns serialised bytes. ``.usdz`` builds a zip archive, ``.usdc/.usd``
+    a binary layer, anything else ascii ``.usda``. Textures are embedded in
+    USDZ archives; for loose files the caller (ModelConverter) writes the
+    ``texture.png`` sidecar via :func:`texture_sidecar_for`.
     """
     if not PXR_AVAILABLE:
         raise RuntimeError("USD export requires the 'usd-core' package "
                            "(pip install usd-core)")
 
-    target = str(file_path or getattr(file_obj, "name", "") or "").lower()
+    target = str(kwargs.get("file_path") or kwargs.get("path")
+                 or getattr(file_obj, "name", "") or "").lower()
     image = _material_image(mesh)
     texture_bytes = _encode_png(image) if image is not None else None
 
@@ -242,6 +248,19 @@ def write_usd(mesh, output_file: str) -> None:
                 logger.debug("Could not write USD texture sidecar: %s", exc)
 
 
+def _export_usdz_dict(mesh, **kwargs):
+    """Multi-file exporter form for ``usdz``.
+
+    trimesh treats a dict return value as a bundle of files and writes every
+    entry through the resolver — but a USDZ is a single zip archive, so we
+    return exactly one member named after the destination (or a generic
+    ``model.usdz`` when the exporter was called without a path).
+    """
+    target = str(kwargs.get("file_path") or kwargs.get("path") or "").lower()
+    name = os.path.basename(target) if target.endswith(".usdz") else "model.usdz"
+    return {name: export_usd(mesh, file_path=target or "x.usdz")}
+
+
 def register() -> bool:
     """Install the USD exporters into trimesh. Safe to call repeatedly."""
     if not PXR_AVAILABLE:
@@ -253,8 +272,9 @@ def register() -> bool:
         return False
     if "usd" in _export._mesh_exporters:
         return True
-    for extension in ("usd", "usda", "usdc", "usdz"):
+    for extension in ("usd", "usda", "usdc"):
         _export._mesh_exporters[extension] = export_usd
+    _export._mesh_exporters["usdz"] = _export_usdz_dict
     logger.info("USD/USDZ exporter registered with trimesh")
     return True
 

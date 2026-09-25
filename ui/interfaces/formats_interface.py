@@ -24,9 +24,11 @@ CATEGORY_ICONS = {
     "Image": FluentIcon.PHOTO,
     "Video": FluentIcon.VIDEO,
     "Audio": FluentIcon.MUSIC,
+    "Document": FluentIcon.FOLDER,
+    "Model": FluentIcon.GLOBE,  # closest 3D-ish glyph in the icon set
 }
 
-CATEGORY_ORDER = ["All", "Image", "Video", "Audio"]
+CATEGORY_ORDER = ["All", "Image", "Video", "Audio", "Document", "Model"]
 
 
 class FormatCard(SimpleCardWidget):
