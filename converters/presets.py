@@ -86,6 +86,11 @@ DOCUMENT_INPUT_EXTENSIONS = (
 
 TEXT_EXTENSIONS = (".txt",)
 
+MODEL_INPUT_EXTENSIONS = (
+    ".stl", ".obj", ".gltf", ".glb", ".usd", ".usda", ".usdc", ".usdz",
+    ".ply", ".off", ".3mf", ".dae", ".fbx", ".xyz",
+)
+
 CATEGORY_EXTENSIONS = {
     "Image": (
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
@@ -98,12 +103,14 @@ CATEGORY_EXTENSIONS = {
         ".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma",
     ),
     "Document": DOCUMENT_INPUT_EXTENSIONS + TEXT_EXTENSIONS,
+    "Model": MODEL_INPUT_EXTENSIONS,
 }
 
 VIDEO_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Video"])
 AUDIO_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Audio"])
 IMAGE_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Image"])
 DOCUMENT_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Document"])
+MODEL_EXTENSIONS = frozenset(CATEGORY_EXTENSIONS["Model"])
 
 
 def category_for_extension(extension: str) -> str:
@@ -119,4 +126,6 @@ def category_for_extension(extension: str) -> str:
         return "Image"
     if extension in DOCUMENT_EXTENSIONS:
         return "Document"
+    if extension in MODEL_EXTENSIONS:
+        return "Model"
     return "Unknown"

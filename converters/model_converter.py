@@ -111,6 +111,13 @@ class ModelConverter(Converter):
         if extension == ".obj":
             self._write_obj(trimesh, mesh, target)
             return
+        if extension in (".usd", ".usda", ".usdc", ".usdz"):
+            # Route USD writing through our pxr-backed exporter: it picks the
+            # right flavour (ascii/binary layer vs. zip archive), embeds or
+            # sidecars textures and validates the USDZ payload.
+            from converters.usd_export import write_usd
+            write_usd(mesh, target)
+            return
         if extension == ".gltf":
             # Sidecar .bin + textures; trimesh needs a directory-based path.
             mesh.export(target)
@@ -137,17 +144,17 @@ class ModelConverter(Converter):
             baseColorFactor=[1.0, 1.0, 1.0, 1.0],
             metallicFactor=0.0, roughnessFactor=1.0,
         )
-        # Meshes loaded from STL/OBJ have no UVs; project the texture with
-        # planar mapping so every face samples the image after conversion.
-        texture = trimesh.visual.TextureVisuals(uv=mesh.visual.uv, material=material)
-        if mesh.visual.uv is None:
-            import numpy as np
+        # Meshes loaded from STL/OBJ have no UVs (and their visual object may
+        # not even expose the attribute); project the texture with planar
+        # mapping so every face samples the image after conversion.
+        import numpy as np
 
+        uvs = getattr(mesh.visual, "uv", None)
+        if uvs is None or len(uvs) != len(mesh.vertices):
             bounds = mesh.bounds
             span = np.maximum(bounds[1] - bounds[0], 1e-9)
-            projected = (mesh.vertices[:, :2] - bounds[0][:2]) / span[:2]
-            texture = trimesh.visual.TextureVisuals(uv=projected, material=material)
-        mesh.visual = texture
+            uvs = (mesh.vertices[:, :2] - bounds[0][:2]) / span[:2]
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, material=material)
 
     # -------------------------------------------------------------- obj --
     @staticmethod

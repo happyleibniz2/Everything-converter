@@ -1,7 +1,2 @@
-# Python compiled files
 __pycache__/
 *.pyc
-
-# Build artifacts
-dist/
-build/
